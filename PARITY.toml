@@ -55,11 +55,11 @@ residuals = 0
 note = "real upb_Decode with an empty mini table (pure unknown fields): status + byte-exact re-encode round-trip, group depth limits, hostile tags"
 
 [wire.decode.message]
-status = "residuals-open"
+status = "parity-sealed"
 oracle = "protobuf:2de70d710510ea7c5ad7ec0c72bfed7f411c7b60"
 court = "decode-known-v1"
-residuals = 27
-note = "known-field decode: scalars (varint/fixed/float), strings/bytes, repeated (unpacked + packed), oneofs. 339/366 cases equal. Residuals confined to the SInt32/SInt64 (and packed SInt32) zigzag munge path: _upb_Decoder_Munge zigzag bit pattern divergence, casefiles dk-sint32-*/dk-sint64-*/dk-psint32-*. Submessages/maps/groups/closed enums not yet emitted by the corpus."
+residuals = 0
+note = "known-field decode, declared scope: scalar fields (all varint/fixed/float types), strings/bytes, repeated scalars (unpacked + packed), repeated strings, oneofs, unknown fields, wire-type mismatches, truncations at every offset of a multi-field message. 516/516 cases equal. Deferred (corpus never emits; DUT rejects defensively): submessages, maps, groups, closed enums, UTF-8-validation modifiers, extensions."
 
 [wire.encode]
 status = "unmapped"

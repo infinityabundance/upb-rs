@@ -15,7 +15,7 @@ happy-path tests.
 | wire decode: fixed32/64   | ORACLE-TESTED | courts/wire-primitives (1537 cases, 0 residuals)       |
 | wire decode: skip         | ORACLE-TESTED | courts/wire-primitives (1537 cases, 0 residuals)       |
 | wire decode: message (empty mini table, pure unknown fields) | ORACLE-TESTED | courts/decode-empty (338 cases, 0 residuals) |
-| wire decode: message (known fields) | RESIDUALS-OPEN | courts/decode-known (339/366 cases; 27 residuals, all in the SInt32/SInt64 zigzag munge path) |
+| wire decode: message (known fields) | PARITY-SEALED | courts/decode-known (516 cases, 0 residuals; scope: scalars, strings/bytes, repeated, oneofs) |
 | wire encode               | UNMAPPED      | —                                                     |
 | mini tables               | ORACLE-TESTED | courts/mini-table-inspect (701 cases, 0 residuals)  |
 | mini descriptors          | ORACLE-TESTED | courts/mini-table-inspect (701 cases, 0 residuals)  |
@@ -33,11 +33,13 @@ happy-path tests.
 ## Current phase
 
 Phase 0 (archaeology + court infrastructure) is established; the wire-primitives,
-decode-empty, and mini-table-inspect courts are live and sealed at 0 residuals
-over the charter boundary-length corpus. The decode-known court (known-field
-message decode) is live at RESIDUALS-OPEN: 339/366 cases equal, with 27
-residuals confined to the SInt32/SInt64 zigzag munge bit pattern
-(casefiles dk-sint32-*, dk-sint64-*, dk-psint32-* in the latest
-receipts/decode-known-v1-*). Next milestones per forensics/OPEN_QUESTIONS.md:
-close the zigzag residuals, then submessages/maps/closed-enum decode, the
-encoder court, and the schema synthesis engine.
+decode-empty, mini-table-inspect, and decode-known courts are live and sealed
+at 0 residuals over the charter boundary-length corpus. The decode-known court
+seals known-field message decode for its declared scope (scalars, strings/bytes,
+repeated unpacked+packed, oneofs, unknown fields, wire-type mismatches,
+truncations): 516/516 cases equal, including the SInt32/SInt64 zigzag munge
+path whose 27 residuals were closed (casefiles dk-sint32-* / dk-sint64-* /
+dk-psint32-* remain in the historical receipts as permanent regression
+evidence). Next milestones per forensics/OPEN_QUESTIONS.md: submessage/map/
+group/closed-enum decode (with linked sub-tables), the encoder court, and the
+schema synthesis engine.

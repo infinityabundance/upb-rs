@@ -26,8 +26,13 @@
 //!   element; a payload extending past the input is malformed (PushLimit
 //!   fails at 212, 295).
 //! * strings: `_upb_Decoder_ReadString` (internal/decoder.h:244-263) — the
-//!   payload must fit the input (no zero-padding), UTF-8 validated for
-//!   String fields (kUpb_DecodeStatus_BadUtf8 at 252).
+//!   payload must fit the input (no zero-padding). UTF-8 validation is gated:
+//!   a String field in a mini descriptor without the message-level
+//!   validate-UTF8 modifier (MSG_MOD_VALIDATE_UTF8) carries the IsAlternate
+//!   flag and behaves as unvalidated bytes (`_upb_Decoder_FieldRequiresUtf8Validation`
+//!   only sees an effective Bytes type); the corpus never sets the modifier,
+//!   so this court's String fields never validate (oracle-verified: `0a01ff`
+//!   on `$1` decodes ok). Validation is a future corpus expansion.
 //! * unknown fields (1010-1081): captured as raw wire spans, preserved in
 //!   wire order; field number 0 is malformed.
 
@@ -225,12 +230,19 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
+/// `_upb_Decoder_Munge` (decode.c:139-153): the wire varint is converted to
+/// the stored representation. For SInt32/SInt64 this is the **inverse** of
+/// zigzag encoding: `(n >> 1) ^ -(n & 1)`. The `-(n & 1)` term is all-ones
+/// when `n` is odd and zero when `n` is even — the sign-extension form
+/// `(n >> 1) ^ (n >> 31)` differs for odd values with the high bit clear
+/// (casefiles dk-sint32-* / dk-sint64-* / dk-psint32-* preserve the
+/// divergence, e.g. wire varint 1 must store 0xFFFFFFFF = -1).
 fn zigzag32(n: u32) -> u32 {
-    (n >> 1) ^ (n as i32 >> 31) as u32
+    (n >> 1) ^ 0u32.wrapping_sub(n & 1)
 }
 
 fn zigzag64(n: u64) -> u64 {
-    (n >> 1) ^ (n as i64 >> 63) as u64
+    (n >> 1) ^ 0u64.wrapping_sub(n & 1)
 }
 
 /// `_upb_Decoder_Munge` (decode.c:139-161) as stored bytes.
@@ -670,4 +682,203 @@ fn decode_unknown_field(
         msg.unknown.extend_from_slice(&input[abs_start..abs_end]);
     }
     Ok(end)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use upb_rs_mini_table::base92;
+
+    /// Field-1 mini descriptor for an encoded type, using the corpus encoder's
+    /// exact formula (`'$'` version byte + base92 field byte). The byte
+    /// patterns are pinned against oracle-verified casefile descriptors below.
+    fn md1(t: u8) -> Vec<u8> {
+        vec![b'$', base92::to_base92(t as i8)]
+    }
+
+    /// Oracle-verified descriptor bytes (casefiles dk-sint32-* / dk-sint64-*,
+    /// md fields `242a` and `242d`; mini-table-inspect court `$)`, `$D`).
+    #[test]
+    fn descriptor_bytes_pin_to_casefiles() {
+        assert_eq!(md1(8), [0x24, 0x2a]); // SInt32 field 1
+        assert_eq!(md1(11), [0x24, 0x2d]); // SInt64 field 1
+        assert_eq!(md1(7), [0x24, 0x29]); // UInt32 field 1
+        assert_eq!(md1(15), [0x24, 0x31]); // String field 1
+        assert_eq!(md1(14), [0x24, 0x30]); // Bytes field 1
+    }
+
+    /// `_upb_Decoder_Munge` SInt32: `(n >> 1) ^ -(int32_t)(n & 1)` — the
+    /// inverse of zigzag. Regression-guard for the sign-extension form bug
+    /// (casefiles dk-sint32-*, e.g. wire 1 must store 0xFFFFFFFF = -1).
+    #[test]
+    fn zigzag32_matches_upstream_munge() {
+        let munge = |n: u32| (n >> 1) ^ 0u32.wrapping_sub(n & 1);
+        for n in 0..=0xFFFF {
+            assert_eq!(zigzag32(n), munge(n), "n={n:#x}");
+        }
+        for n in [
+            0x3FFF_FFFF,
+            0x4000_0000,
+            0x7FFF_FFFF,
+            0x8000_0000,
+            0xFFFF_FFFF,
+            0x8000_0001,
+            0xFFFF_FFFE,
+        ] {
+            assert_eq!(zigzag32(n), munge(n), "n={n:#x}");
+        }
+        // Spot values: wire 1 -> -1, wire 2 -> 1, wire 3 -> -2,
+        // wire 0xFFFFFFFF -> 0x80000000 (INT32_MIN).
+        assert_eq!(zigzag32(1), 0xFFFF_FFFF);
+        assert_eq!(zigzag32(2), 1);
+        assert_eq!(zigzag32(3), 0xFFFF_FFFE);
+        assert_eq!(zigzag32(0xFFFF_FFFF), 0x8000_0000);
+    }
+
+    /// `_upb_Decoder_Munge` SInt64: `(n >> 1) ^ -(int64_t)(n & 1)`.
+    #[test]
+    fn zigzag64_matches_upstream_munge() {
+        let munge = |n: u64| (n >> 1) ^ 0u64.wrapping_sub(n & 1);
+        for n in 0..=0xFFFF {
+            assert_eq!(zigzag64(n), munge(n), "n={n:#x}");
+        }
+        for n in [
+            0x3FFF_FFFF_FFFF_FFFF,
+            0x4000_0000_0000_0000,
+            0x7FFF_FFFF_FFFF_FFFF,
+            0x8000_0000_0000_0000,
+            0xFFFF_FFFF_FFFF_FFFF,
+            0x8000_0000_0000_0001,
+        ] {
+            assert_eq!(zigzag64(n), munge(n), "n={n:#x}");
+        }
+        assert_eq!(zigzag64(1), 0xFFFF_FFFF_FFFF_FFFF);
+        assert_eq!(zigzag64(2), 1);
+        assert_eq!(zigzag64(3), 0xFFFF_FFFF_FFFF_FFFE);
+        assert_eq!(zigzag64(0xFFFF_FFFF_FFFF_FFFF), 0x8000_0000_0000_0000);
+    }
+
+    /// `_upb_Decoder_Munge` Bool: `val->bool_val = val->uint64_val != 0`
+    /// (decode.c:141-142). A wire value of 2 is true, not `& 1`.
+    #[test]
+    fn munge_bool_is_nonzero() {
+        let f = MiniTableField {
+            number: 1,
+            offset: 0,
+            presence: 0,
+            submsg_ofs: 0xFFFF,
+            descriptortype: 8,
+            mode: 0,
+        };
+        for v in [0u64, 1, 2, 0x7F, 0x80, 0x3FFF, u64::MAX] {
+            assert_eq!(munge(&f, v), (v != 0) as u64, "v={v:#x}");
+        }
+    }
+
+    /// End-to-end: SInt32 field 1 with wire varint 1 must store 0xFFFFFFFF
+    /// (=-1) at the field offset — the exact casefile dk-000052 divergence.
+    #[test]
+    fn decode_sint32_odd_wire_value() {
+        let mt = upb_rs_mini_table::decode::build_mini_table(&md1(8))
+            .unwrap()
+            .0;
+        let m = decode_known(&md1(8), &[0x08, 0x01], 100).unwrap();
+        let off = mt.fields[0].offset as usize;
+        assert_eq!(&m.buf[off..off + 4], &[0xFF; 4]);
+    }
+
+    /// End-to-end: SInt64 field 1 with wire varint 1 stores all-ones (=-1).
+    #[test]
+    fn decode_sint64_odd_wire_value() {
+        let mt = upb_rs_mini_table::decode::build_mini_table(&md1(11))
+            .unwrap()
+            .0;
+        let m = decode_known(&md1(11), &[0x08, 0x01], 100).unwrap();
+        let off = mt.fields[0].offset as usize;
+        assert_eq!(&m.buf[off..off + 8], &[0xFF; 8]);
+    }
+
+    /// End-to-end: bool field 1 with wire varint 2 stores 1 (true).
+    #[test]
+    fn decode_bool_nonzero_wire_value() {
+        let m = decode_known(&md1(13), &[0x08, 0x02], 100).unwrap();
+        let mt = upb_rs_mini_table::decode::build_mini_table(&md1(13))
+            .unwrap()
+            .0;
+        let off = mt.fields[0].offset as usize;
+        assert_eq!(m.buf[off], 1);
+    }
+
+    /// A tag with no value is malformed (the zero-padded varint read
+    /// succeeds, then the follow-on zero tag is field number 0). Empty input
+    /// is a valid empty message, mirroring upb_Decode on an empty buffer.
+    #[test]
+    fn truncated_input_is_malformed() {
+        assert!(matches!(
+            decode_known(&md1(7), &[0x08], 100),
+            Err(KnownDecodeError::Malformed)
+        ));
+    }
+
+    #[test]
+    fn empty_input_decodes_empty_message() {
+        let m = decode_known(&md1(7), &[], 100).unwrap();
+        assert!(m.unknown.is_empty());
+        assert!(m.arrays.is_empty());
+    }
+
+    /// Unknown fields are captured as raw wire spans in wire order.
+    #[test]
+    fn unknown_field_retained_in_wire_order() {
+        // field 99 (tag 0x98 0x06) varint 5, then field 1 uint32 = 7.
+        let m = decode_known(&md1(7), &[0x98, 0x06, 0x05, 0x08, 0x07], 100).unwrap();
+        assert_eq!(m.unknown, [0x98, 0x06, 0x05]);
+        let mt = upb_rs_mini_table::decode::build_mini_table(&md1(7))
+            .unwrap()
+            .0;
+        // presence is the hasbit index (64 for this layout, oracle-verified
+        // via mini_table_inspect on `$)`); the bit must be set for field 1.
+        assert!(mt.fields[0].presence > 0);
+        assert!(m.hasbit_set(mt.fields[0].presence as u16));
+        let off = mt.fields[0].offset as usize;
+        assert_eq!(&m.buf[off..off + 4], &[7, 0, 0, 0]);
+    }
+
+    /// At this pin, a String field built from a plain mini descriptor does
+    /// **not** validate UTF-8 (validation is gated on the validate-UTF8
+    /// modifier, which the corpus never sets). Oracle-verified: `0a01ff` with
+    /// `$1` decodes ok with value `ff`. Bytes fields accept any content.
+    #[test]
+    fn string_content_preserved_without_utf8_check() {
+        let bad: Vec<u8> = vec![0x0A, 0x01, 0xFF];
+        let s = decode_known(&md1(15), &bad, 100).unwrap();
+        // String content is keyed by field number (apply_string).
+        assert_eq!(s.strings.get(&1).map(Vec::as_slice), Some(&[0xFF][..]));
+        let b = decode_known(&md1(14), &bad, 100).unwrap();
+        assert_eq!(b.strings.get(&1).map(Vec::as_slice), Some(&[0xFF][..]));
+    }
+
+    /// Field number 0 (tag 0x00) is malformed.
+    #[test]
+    fn field_number_zero_is_malformed() {
+        assert!(matches!(
+            decode_known(&md1(7), &[0x00], 100),
+            Err(KnownDecodeError::Malformed)
+        ));
+    }
+
+    /// Submessages are deferred. Documented divergence (category 9): the DUT
+    /// rejects the descriptor defensively (the corpus never emits one), while
+    /// the oracle stores the whole field as unknown bytes — oracle-verified
+    /// `0a00` with `$3` (encoded Message, TO_BASE92[17] = '3') returns ok with
+    /// unknown `0a00`. To resolve in the submessage court, which will link
+    /// real sub-tables.
+    #[test]
+    fn submessage_rejected_as_unsupported() {
+        // Message field 1 (encoded type 17 = Message): `$3' (0x24 0x33).
+        assert!(matches!(
+            decode_known(&[0x24, 0x33], &[0x0A, 0x00], 100),
+            Err(KnownDecodeError::Unsupported(_))
+        ));
+    }
 }

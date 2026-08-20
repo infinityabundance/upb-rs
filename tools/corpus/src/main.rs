@@ -944,6 +944,23 @@ fn gen_decode_known_corpus(set: &mut CaseSet) {
             encode_varint(v, &mut m);
             values.push(m);
         }
+        // Zigzag-munge boundaries (the dk-sint32-*/dk-sint64-* residual set
+        // came from odd wire values with the high bit clear; these cover the
+        // odd/even/high-bit corners of _upb_Decoder_Munge).
+        for v in [
+            0x3FFF_FFFFu64,
+            0x4000_0000,
+            0x7FFF_FFFF,
+            0x8000_0000,
+            0xFFFF_FFFF,
+            0x1_0000_0000,
+            0x7FFF_FFFF_FFFF_FFFF,
+            0x8000_0000_0000_0000,
+        ] {
+            let mut m = vec![0x08u8];
+            encode_varint(v, &mut m);
+            values.push(m);
+        }
         // Overlong encodings of 1.
         for n in 2..=10usize {
             let mut m = vec![0x08u8];
@@ -953,6 +970,9 @@ fn gen_decode_known_corpus(set: &mut CaseSet) {
         for (i, v) in values.iter().enumerate() {
             set.push_md("decode_known", &md, v, &format!("dk-{name}-varint-{i}"));
         }
+        // Truncation: a bare tag with no value bytes, and the empty input.
+        set.push_md("decode_known", &md, &[0x08], &format!("dk-{name}-bare-tag"));
+        set.push_md("decode_known", &md, &[], &format!("dk-{name}-empty"));
         // Fixed-width values for fixed types.
         if matches!(t, 0..=5) {
             let (tag, n) = if matches!(t, 2 | 4 | 1) {
