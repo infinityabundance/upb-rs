@@ -618,11 +618,12 @@ static size_t field_elem_size(uint8_t type) {
 // kUpb_NoSub (mini_table/internal/field.h:37): no sub slot for this field.
 #define kUpb_NoSub_ ((uint16_t)0xFFFF)
 
-// True when the field carries a linked sub-message (descriptor type Message
-// with a sub slot). Group (10) and closed-enum (14) fields also reserve slots;
-// this court only emits Message fields.
+// True when the field carries a linked sub-message (descriptor types Message
+// (11) and Group (10) with a sub slot). Closed-enum (14) fields also reserve
+// slots but dump as scalars.
 static int field_is_submsg(const upb_MiniTableField* f) {
-  return f->descriptortype_dont_copy_me__upb_internal_use_only == 11 &&
+  uint8_t t = f->descriptortype_dont_copy_me__upb_internal_use_only;
+  return (t == 11 || t == 10) &&
          f->submsg_ofs_dont_copy_me__upb_internal_use_only != kUpb_NoSub_;
 }
 

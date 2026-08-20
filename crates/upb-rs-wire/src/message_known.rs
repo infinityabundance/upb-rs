@@ -180,6 +180,29 @@ impl Message {
     }
 }
 
+/// Presence bookkeeping shared by singular sub-message and group fields
+/// (`_upb_Decoder_DecodeToSubMessage`, decode.c:546-557). Returns whether an
+/// existing value should be merged into; a oneof switch drops the previous
+/// member's storage (upstream memsets the pointer to NULL, orphaning the old
+/// submessage in the arena; the model removes the stale entry so a later
+/// occurrence of this member does not merge into it).
+fn prepare_singular_submsg(msg: &mut Message, f: &MiniTableField) -> bool {
+    if f.presence > 0 {
+        msg.set_hasbit(f.presence as u16);
+        msg.submsgs.contains_key(&(f.number as usize))
+    } else if f.is_in_oneof() {
+        let case_off = (!f.presence) as u16;
+        let switching = msg.oneof_case(case_off) != f.number;
+        if switching {
+            msg.submsgs.remove(&(f.number as usize));
+        }
+        msg.set_oneof_case(case_off, f.number);
+        !switching
+    } else {
+        true
+    }
+}
+
 /// A pool of mini tables with linked sub-slots (the mini-descriptor analog of
 /// upstream's table pool + `upb_MiniTable_Link`). Sub slots are assigned in
 /// field order during build (`set_type_and_sub`, decode.rs:364-369), so slot
@@ -306,7 +329,8 @@ impl Message {
                     oneof_offsets.push(off);
                 }
             }
-            let is_submsg = f.descriptortype == 11 && f.submsg_ofs != NO_SUB;
+            let is_submsg =
+                (f.descriptortype == 11 || f.descriptortype == 10) && f.submsg_ofs != NO_SUB;
             let subl = ts.sub(table_idx, i);
             if f.mode_class() == FieldMode::Map {
                 // Map fields carry no presence; render the content (empty
@@ -485,7 +509,7 @@ pub fn decode_known(descriptor: &[u8], input: &[u8], max_depth: u32) -> Result<M
     let mut msg = Message::new(ts.main().size as usize);
     let mut stream = EpsCopyStream::init(input);
     let mut ptr = 0usize;
-    decode_message(&ts, 0, &mut msg, &mut stream, &mut ptr, depth, input)?;
+    decode_message(&ts, 0, &mut msg, &mut stream, &mut ptr, depth, input, None)?;
     Ok(msg)
 }
 
@@ -506,16 +530,15 @@ pub fn decode_submsg(
     let mut msg = Message::new(ts.main().size as usize);
     let mut stream = EpsCopyStream::init(input);
     let mut ptr = 0usize;
-    decode_message(&ts, 0, &mut msg, &mut stream, &mut ptr, depth, input)?;
+    decode_message(&ts, 0, &mut msg, &mut stream, &mut ptr, depth, input, None)?;
     Ok(msg)
 }
 
 fn reject_deferred(mt: &MiniTable) -> Result<()> {
-    for f in &mt.fields {
-        if f.descriptortype == 10 {
-            return Err(KnownDecodeError::Unsupported("group"));
-        }
-    }
+    // All encoded types are supported at this surface. (Groups decode
+    // through their linked sub tables; unlinked sub-slots decode as unknown
+    // fields, matching upstream's contract.)
+    let _ = mt;
     Ok(())
 }
 
@@ -529,9 +552,18 @@ fn effective_depth(max_depth: u32) -> i32 {
 
 /// `_upb_Decoder_DecodeMessage` (decode.c:1256-1271): one message's field
 /// loop. Recurses into linked submessage fields with a decremented depth
-/// budget (`_upb_Decoder_RecurseSubMessage`, decode.c:199-207). An EndGroup
-/// tag is malformed at this surface (expected_end_group is always
-/// DECODE_NOGROUP for submessages and the top level; groups are deferred).
+/// budget (`_upb_Decoder_RecurseSubMessage`, decode.c:199-207).
+///
+/// `expected_end_group` is `Some(field_number)` only when decoding a group
+/// body (`_upb_Decoder_DecodeGroup`, decode.c:220-231): the body ends at the
+/// matching EndGroup tag, and an EOF before it is malformed (the caller's
+/// `d->end_group != expected` check). For every other message level it is
+/// None (DECODE_NOGROUP): an EndGroup tag is malformed.
+///
+/// The parameter set mirrors the upstream `upb_Decoder` state threaded
+/// through the recursive descent; it will be bundled into a decoder struct
+/// when the kernel phase requires the arena-backed message model.
+#[allow(clippy::too_many_arguments)]
 fn decode_message(
     ts: &TableSet,
     table_idx: usize,
@@ -540,12 +572,19 @@ fn decode_message(
     ptr: &mut usize,
     depth: i32,
     input: &[u8],
+    expected_end_group: Option<u32>,
 ) -> Result<()> {
     let mt = ts.table(table_idx);
     loop {
         let done = stream.is_done(ptr);
         if done {
             if stream.is_error() {
+                return Err(KnownDecodeError::Malformed);
+            }
+            // A group body that runs off the end of the input never saw its
+            // EndGroup: malformed (`d->end_group != expected` in
+            // RecurseSubMessage, decode.c:202-204).
+            if expected_end_group.is_some() {
                 return Err(KnownDecodeError::Malformed);
             }
             break;
@@ -557,7 +596,13 @@ fn decode_message(
         let wire_type = (tag.value & 7) as u8;
 
         if wire_type == 4 {
-            return Err(KnownDecodeError::Malformed);
+            // EndGroup: ends the current message only when it matches the
+            // enclosing group (`d->end_group = tag >> 3; break;` then the
+            // RecurseSubMessage check, decode.c:1231-1237, 202-204).
+            match expected_end_group {
+                Some(n) if n == field_number => return Ok(()),
+                _ => return Err(KnownDecodeError::Malformed),
+            }
         }
 
         let abs_start = stream.absolute(start);
@@ -660,7 +705,7 @@ fn decode_message(
                     if depth - 1 < 0 {
                         return Err(KnownDecodeError::MaxDepthExceeded);
                     }
-                    decode_message(ts, sub_idx, &mut elem, stream, ptr, depth - 1, input)?;
+                    decode_message(ts, sub_idx, &mut elem, stream, ptr, depth - 1, input, None)?;
                     stream.pop_limit(*ptr, delta);
                     msg.submsg_arrays
                         .entry(f.number as usize)
@@ -673,20 +718,7 @@ fn decode_message(
                     // orphaning the old submessage in the arena; the model
                     // drops the stale entry so a later occurrence of this
                     // member does not merge into it).
-                    let merge = if f.presence > 0 {
-                        msg.set_hasbit(f.presence as u16);
-                        msg.submsgs.contains_key(&(f.number as usize))
-                    } else if f.is_in_oneof() {
-                        let case_off = (!f.presence) as u16;
-                        let switching = msg.oneof_case(case_off) != f.number;
-                        if switching {
-                            msg.submsgs.remove(&(f.number as usize));
-                        }
-                        msg.set_oneof_case(case_off, f.number);
-                        !switching
-                    } else {
-                        true
-                    };
+                    let merge = prepare_singular_submsg(msg, f);
                     if !merge {
                         msg.submsgs
                             .insert(f.number as usize, Message::new(sub_size));
@@ -702,8 +734,65 @@ fn decode_message(
                     if depth - 1 < 0 {
                         return Err(KnownDecodeError::MaxDepthExceeded);
                     }
-                    decode_message(ts, sub_idx, submsg, stream, ptr, depth - 1, input)?;
+                    decode_message(ts, sub_idx, submsg, stream, ptr, depth - 1, input, None)?;
                     stream.pop_limit(*ptr, delta);
+                }
+            }
+            Op::Group => {
+                // `_upb_Decoder_DecodeKnownGroup` (decode.c:234-241) ->
+                // `_upb_Decoder_DecodeGroup` (decode.c:220-231): the body is
+                // bounded by the matching EndGroup tag, not a length prefix.
+                let field_index = field_index.expect("group field");
+                let sub_idx = ts
+                    .sub(table_idx, field_index)
+                    .expect("Group op implies a linked sub table");
+                let sub_size = ts.table(sub_idx).size as usize;
+                if f.mode_class() == FieldMode::Array {
+                    // `_upb_Decoder_DecodeToArray` with a group element type
+                    // (decode.c:405-418): a new element per occurrence, no
+                    // merge, no presence bit.
+                    let mut elem = Message::new(sub_size);
+                    if depth - 1 < 0 {
+                        return Err(KnownDecodeError::MaxDepthExceeded);
+                    }
+                    decode_message(
+                        ts,
+                        sub_idx,
+                        &mut elem,
+                        stream,
+                        ptr,
+                        depth - 1,
+                        input,
+                        Some(f.number),
+                    )?;
+                    msg.submsg_arrays
+                        .entry(f.number as usize)
+                        .or_default()
+                        .push(elem);
+                } else {
+                    let merge = prepare_singular_submsg(msg, f);
+                    if !merge {
+                        msg.submsgs
+                            .insert(f.number as usize, Message::new(sub_size));
+                    } else {
+                        msg.submsgs
+                            .entry(f.number as usize)
+                            .or_insert_with(|| Message::new(sub_size));
+                    }
+                    let submsg = msg.submsgs.get_mut(&(f.number as usize)).expect("inserted");
+                    if depth - 1 < 0 {
+                        return Err(KnownDecodeError::MaxDepthExceeded);
+                    }
+                    decode_message(
+                        ts,
+                        sub_idx,
+                        submsg,
+                        stream,
+                        ptr,
+                        depth - 1,
+                        input,
+                        Some(f.number),
+                    )?;
                 }
             }
             Op::Map => {
@@ -724,7 +813,7 @@ fn decode_message(
                 if depth - 1 < 0 {
                     return Err(KnownDecodeError::MaxDepthExceeded);
                 }
-                decode_message(ts, entry_idx, &mut ent, stream, ptr, depth - 1, input)?;
+                decode_message(ts, entry_idx, &mut ent, stream, ptr, depth - 1, input, None)?;
                 stream.pop_limit(*ptr, delta);
                 if !ent.unknown.is_empty() {
                     // `_upb_Encoder_AddMapEntryUnknown`
@@ -780,6 +869,7 @@ enum Op {
     String,
     Bytes,
     SubMessage,
+    Group,
     Map,
     VarintPacked(usize),
     FixedPacked(usize),
@@ -835,9 +925,11 @@ fn decode_wire_value(
             ))
         }
         3 => {
-            // StartGroup: valid only for group fields (deferred surface).
-            if field.descriptortype == 10 {
-                Err(KnownDecodeError::Unsupported("group"))
+            // StartGroup: a known group field (type 10) with a linked sub
+            // table decodes the group body; everything else is an unknown
+            // field (skipped as a group by decode_unknown_field).
+            if field.descriptortype == 10 && ts.sub(table_idx, field_index).is_some() {
+                Ok((Op::Group, None, ptr))
             } else {
                 Ok((Op::Unknown, None, ptr))
             }
@@ -1312,6 +1404,18 @@ fn encode_message(msg: &Message, ts: &TableSet, table_idx: usize) -> Vec<u8> {
                         }
                     }
                 }
+                10 => {
+                    // Repeated group: bracketed by the start/end group tags.
+                    if let Some(elems) = msg.submsg_arrays.get(&(f.number as usize)) {
+                        let sub = ts.sub(table_idx, i);
+                        for e in elems {
+                            let body = sub.map(|s| encode_message(e, ts, s)).unwrap_or_default();
+                            encode_varint(&mut out, (number << 3) | 3);
+                            out.extend(body);
+                            encode_varint(&mut out, (number << 3) | 4);
+                        }
+                    }
+                }
                 t if is_varint_type(t) => {
                     if let Some(elems) = msg.arrays.get(&(f.number as usize)) {
                         if f.is_packed() {
@@ -1378,7 +1482,20 @@ fn encode_message(msg: &Message, ts: &TableSet, table_idx: usize) -> Vec<u8> {
                         encode_varint(&mut out, payload.len() as u64);
                         out.extend(payload);
                     }
-                    10 => { /* groups deferred */ }
+                    10 => {
+                        // Singular group: start tag, body, end tag.
+                        let body = match ts.sub(table_idx, i) {
+                            Some(s) => msg
+                                .submsgs
+                                .get(&(f.number as usize))
+                                .map(|m| encode_message(m, ts, s))
+                                .unwrap_or_default(),
+                            None => Vec::new(),
+                        };
+                        encode_varint(&mut out, (number << 3) | 3);
+                        out.extend(body);
+                        encode_varint(&mut out, (number << 3) | 4);
+                    }
                     t if is_varint_type(t) || is_fixed32_type(t) || is_fixed64_type(t) => {
                         let n = scalar_width(f);
                         let off = f.offset as usize;
@@ -1899,6 +2016,119 @@ mod tests {
             &["2433", "252928"],
             &[&[1], &[]],
             &[0x0A, 0x03, 0x08, 0x05, 0x10], // val varint truncated
+            100,
+        );
+        assert!(matches!(e, Err(KnownDecodeError::Malformed)));
+    }
+
+    /// A { group G g = 1; } ($2) G { uint32 x = 1; } ($)). The group body is
+    /// bounded by the matching EndGroup tag; repeated occurrences merge.
+    #[test]
+    fn group_singular_merge() {
+        // g{x:1} g{x:2} -> merged {x:2}
+        let m = dsub(
+            &["2432", "2429"],
+            &[&[1], &[]],
+            &[0x0B, 0x08, 0x01, 0x0C, 0x0B, 0x08, 0x02, 0x0C],
+            100,
+        )
+        .unwrap();
+        assert_eq!(m.oneof_case(0), 0);
+        let g = m.submsgs.get(&1).expect("g");
+        assert_eq!(g.buf[12..16], 2u32.to_le_bytes());
+    }
+
+    /// An empty group body is valid; EOF after the StartGroup tag or before
+    /// the EndGroup is malformed; a mismatched EndGroup is malformed.
+    #[test]
+    fn group_boundaries_and_malformed() {
+        // Empty body: `0b 0c`.
+        let m = dsub(&["2432", "2429"], &[&[1], &[]], &[0x0B, 0x0C], 100).unwrap();
+        assert!(m.submsgs.contains_key(&1));
+        // EOF right after the start tag.
+        let e = dsub(&["2432", "2429"], &[&[1], &[]], &[0x0B], 100);
+        assert!(matches!(e, Err(KnownDecodeError::Malformed)));
+        // EOF mid-body.
+        let e = dsub(&["2432", "2429"], &[&[1], &[]], &[0x0B, 0x08, 0x05], 100);
+        assert!(matches!(e, Err(KnownDecodeError::Malformed)));
+        // EndGroup for the wrong field number (2): `0b 14`.
+        let e = dsub(&["2432", "2429"], &[&[1], &[]], &[0x0B, 0x14], 100);
+        assert!(matches!(e, Err(KnownDecodeError::Malformed)));
+    }
+
+    /// Repeated groups ($F): one element per occurrence.
+    #[test]
+    fn group_repeated() {
+        let m = dsub(
+            &["2446", "2429"],
+            &[&[1], &[]],
+            &[0x0B, 0x08, 0x01, 0x0C, 0x0B, 0x08, 0x02, 0x0C],
+            100,
+        )
+        .unwrap();
+        let elems = m.submsg_arrays.get(&1).expect("repeated g");
+        assert_eq!(elems.len(), 2);
+        assert_eq!(elems[0].buf[12..16], 1u32.to_le_bytes());
+        assert_eq!(elems[1].buf[12..16], 2u32.to_le_bytes());
+    }
+
+    /// An unlinked group field decodes as an unknown field (the whole group
+    /// span is preserved).
+    #[test]
+    fn group_unlinked_is_unknown() {
+        let m = dsub(
+            &["2432", "2429"],
+            &[&[], &[]],
+            &[0x0B, 0x08, 0x05, 0x0C],
+            100,
+        )
+        .unwrap();
+        assert!(!m.submsgs.contains_key(&1));
+        assert_eq!(m.unknown, [0x0B, 0x08, 0x05, 0x0C]);
+    }
+
+    /// A group in a oneof: switching members clears the previous group's
+    /// presence (the stale storage is unobservable — the dump and encoder
+    /// gate on the case word).
+    #[test]
+    fn group_oneof_switch() {
+        // A { oneof { group G g = 1; uint32 x = 2; } } ($2)^!|# oracle-verified).
+        // g{x:5} x:7 -> case 2, x:7 (g no longer present).
+        let m = dsub(
+            &["2432295e217c23", "2429"],
+            &[&[1], &[]],
+            &[0x0B, 0x08, 0x05, 0x0C, 0x10, 0x07],
+            100,
+        )
+        .unwrap();
+        assert_eq!(m.oneof_case(8), 2);
+        assert_eq!(m.buf[16..20], 7u32.to_le_bytes()); // x at the member slot
+        let ts = TableSet::from_pool(&[&dh("2432295e217c23"), &dh("2429")], &[&[1], &[]]).unwrap();
+        let dump = m.dump(&ts, 0);
+        let fields = dump["fields"].as_array().unwrap();
+        assert!(!fields.iter().any(|f| f["number"] == 1)); // g absent
+        assert!(fields.iter().any(|f| f["number"] == 2)); // x present
+    }
+
+    /// Nested groups: the inner group's EndGroup ends only the inner body.
+    #[test]
+    fn group_nested() {
+        // A { group G g = 1; } G { group H h = 1; } H { uint32 x = 1; }.
+        let m = dsub(
+            &["2432", "2432", "2429"],
+            &[&[1], &[2], &[]],
+            &[0x0B, 0x0B, 0x08, 0x05, 0x0C, 0x0C],
+            100,
+        )
+        .unwrap();
+        let g = m.submsgs.get(&1).expect("g");
+        let h = g.submsgs.get(&1).expect("h");
+        assert_eq!(h.buf[12..16], 5u32.to_le_bytes());
+        // Missing the outer EndGroup: malformed.
+        let e = dsub(
+            &["2432", "2432", "2429"],
+            &[&[1], &[2], &[]],
+            &[0x0B, 0x0B, 0x08, 0x05, 0x0C],
             100,
         );
         assert!(matches!(e, Err(KnownDecodeError::Malformed)));

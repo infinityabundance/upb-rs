@@ -1838,6 +1838,147 @@ fn gen_decode_submsg_corpus(set: &mut CaseSet) {
             "mp-nested-size-underrun",
         );
     }
+    // Group fields (wire types 3/4; descriptor encoded type 16 = Group,
+    // 36 = repeated group). The body is bounded by the matching EndGroup
+    // tag, not a length prefix.
+    {
+        // A { group G g = 1; } G { uint32 x = 1; }.
+        let mds = vec![md_fields(&[(1, 16)]), md_fields(&[(1, 7)])];
+        let links = vec![vec![1], vec![]];
+        set.push_submsg(&mds, &links, &[], "gp-empty");
+        set.push_submsg(&mds, &links, &[0x0B, 0x08, 0x05, 0x0C], "gp-one");
+        set.push_submsg(&mds, &links, &[0x0B, 0x0C], "gp-empty-body");
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0B, 0x08, 0x01, 0x0C, 0x0B, 0x08, 0x02, 0x0C],
+            "gp-merge",
+        );
+        // Group with an unknown field inside; group with a wire-mismatched
+        // known field inside.
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0B, 0x1D, 0x00, 0x00, 0x00, 0x00, 0x0C],
+            "gp-inner-unknown",
+        );
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0B, 0x0A, 0x03, 0x61, 0x62, 0x63, 0x0C],
+            "gp-inner-wire-mismatch",
+        );
+        // Malformed: EOF after the start tag; EOF mid-body; mismatched
+        // EndGroup field number; EndGroup at the top level; truncated.
+        set.push_submsg(&mds, &links, &[0x0B], "gp-eof-after-start");
+        set.push_submsg(&mds, &links, &[0x0B, 0x08, 0x05], "gp-eof-mid-body");
+        set.push_submsg(&mds, &links, &[0x0B, 0x14], "gp-wrong-end-group");
+        set.push_submsg(&mds, &links, &[0x0B, 0x0C, 0x0C], "gp-endgroup-at-top");
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0B, 0x08, 0x05, 0x0C, 0x08, 0x01],
+            "gp-with-trailing-scalar",
+        );
+        // Unlinked group slot -> the whole group decodes as unknown.
+        let unlinked = vec![vec![], vec![]];
+        set.push_submsg(&mds, &unlinked, &[0x0B, 0x08, 0x05, 0x0C], "gp-unlinked");
+        let full = [0x0B, 0x08, 0x05, 0x0C];
+        push_truncations(set, &mds, &links, &full, "gp-one");
+        // Depth: the group body consumes one level.
+        set.push_submsg_depth(&mds, &links, &[0x0B, 0x08, 0x05, 0x0C], 1, "gp-depth1");
+        set.push_submsg_depth(&mds, &links, &[0x0B, 0x08, 0x05, 0x0C], 2, "gp-depth2");
+    }
+    // Repeated groups: A { repeated group G g = 1; } (encoded type 36).
+    {
+        let mds = vec![md_fields(&[(1, 16 + REPEATED_BASE)]), md_fields(&[(1, 7)])];
+        let links = vec![vec![1], vec![]];
+        set.push_submsg(&mds, &links, &[], "gpr-empty");
+        set.push_submsg(&mds, &links, &[0x0B, 0x0C], "gpr-one-empty");
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0B, 0x08, 0x01, 0x0C, 0x0B, 0x08, 0x02, 0x0C],
+            "gpr-two",
+        );
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0B, 0x08, 0x01, 0x0C, 0x0B, 0x08],
+            "gpr-trunc-second",
+        );
+        let full = [0x0B, 0x08, 0x01, 0x0C, 0x0B, 0x08, 0x02, 0x0C];
+        push_truncations(set, &mds, &links, &full, "gpr-two");
+    }
+    // Nested groups: A { group G g = 1; } G { group H h = 1; } H { uint32 x = 1; }.
+    {
+        let mds = vec![
+            md_fields(&[(1, 16)]),
+            md_fields(&[(1, 16)]),
+            md_fields(&[(1, 7)]),
+        ];
+        let links = vec![vec![1], vec![2], vec![]];
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0B, 0x0B, 0x08, 0x05, 0x0C, 0x0C],
+            "gpn-nested",
+        );
+        set.push_submsg(&mds, &links, &[0x0B, 0x0B, 0x0C, 0x0C], "gpn-two-empty");
+        // The inner EndGroup ends only the inner body; the outer must follow.
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0B, 0x0B, 0x08, 0x05, 0x0C],
+            "gpn-missing-outer-end",
+        );
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0B, 0x0B, 0x08, 0x05, 0x0C, 0x08, 0x01, 0x0C],
+            "gpn-trailing-in-outer",
+        );
+        set.push_submsg_depth(
+            &mds,
+            &links,
+            &[0x0B, 0x0B, 0x08, 0x05, 0x0C, 0x0C],
+            2,
+            "gpn-depth2",
+        );
+        set.push_submsg_depth(
+            &mds,
+            &links,
+            &[0x0B, 0x0B, 0x08, 0x05, 0x0C, 0x0C],
+            1,
+            "gpn-depth1",
+        );
+    }
+    // Group in a oneof: A { oneof { group G g = 1; uint32 x = 2; } }.
+    {
+        let mds = vec![md_oneof(&[(1, 16), (2, 7)]), md_fields(&[(1, 7)])];
+        let links = vec![vec![1], vec![]];
+        set.push_submsg(&mds, &links, &[0x0B, 0x08, 0x05, 0x0C], "gpo-group-only");
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0B, 0x08, 0x05, 0x0C, 0x10, 0x07],
+            "gpo-group-then-scalar",
+        );
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x10, 0x07, 0x0B, 0x08, 0x05, 0x0C],
+            "gpo-scalar-then-group",
+        );
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0B, 0x08, 0x05, 0x0C, 0x0B, 0x08, 0x06, 0x0C],
+            "gpo-group-merge",
+        );
+        set.push_submsg(&mds, &links, &[0x0B, 0x14], "gpo-wrong-end-group");
+        set.push_submsg(&mds, &links, &[0x0C], "gpo-endgroup-top");
+    }
 }
 
 fn main() {
