@@ -1,12 +1,12 @@
 [package]
 name = "upb-rs-core"
-version.workspace = true
+version = "0.1.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 rust-version.workspace = true
-description = "Core types and error model for upb-rs, mirroring upb/base and upb/wire/types.h"
+description = "Core types, error model, arena, and array/map collections for upb-rs, mirroring upb/base, upb/wire/types.h, upb/mem/arena, and upb/message/{array,map}"
 
 [dependencies]
 serde = { workspace = true }

@@ -88,6 +88,11 @@ already-parsed tag value (`field_number << 3 | wire_type`), decimal.
 | `mini_table_inspect`| `upb_MiniTable_Build` | — | builds a mini table from a mini descriptor; see below |
 | `decode_known` | `upb_Decode` (mini table from descriptor) | — | real message decode with known fields; see below |
 | `decode_submsg` | `upb_Decode` (pool of linked mini tables) | — | sub-message decode with linked sub-slots; see below |
+| `arena_info`  | build constants                    | — | the arena build configuration of this oracle binary; see below |
+| `arena_trace` | scripted `upb_Arena` ops            | — | allocation traces under a controlled allocator; see below |
+| `arena_fuse`  | scripted two-arena fuse lifetime    | — | fuse + cleanup + free behavior; see below |
+| `array_trace` | scripted `upb_Array` ops            | — | array content + arena accounting; see below |
+| `map_trace`   | scripted `upb_Map` ops              | — | map content semantics; see below |
 | `ping`        | —                        | —   | protocol self-test |
 
 ## `mini_table_inspect`
@@ -214,6 +219,124 @@ current case word (0 when unset) — presence-independent, oracle-verified
 Statuses: `ok` (with `dump`), or `error` with `code` one of `malformed`,
 `max_depth_exceeded`, `oom`, `minitable_build_failed`, `bad_hex`,
 `bad_links`, `link_failed`, `other`.
+
+## `arena_info`
+
+Reports the arena build constants compiled into this oracle binary (the DUT
+asserts these equal `RELEASE_CONFIG` before running arena-dependent courts):
+
+```json
+{"v":1,"id":1,"status":"ok","arena":{
+  "malloc_align":8,"guard_size":0,"memblock_reserve":16,
+  "state_reserve":80,"default_max_block_size":32768}}
+```
+
+## `arena_trace`
+
+Runs a scripted sequence of allocation ops against a real `upb_Arena` whose
+malloc is served by a **controlled exact-size allocator** with OOM injection
+(`fail_after_bytes`: once the cumulative requested bytes exceed the budget,
+allocations fail). The request carries the arena configuration and an op
+script:
+
+```json
+{"v":1,"id":1,"op":"arena_trace",
+ "arena":{"initial_block":0,"alloc":true,"max_block_size":0,
+          "fail_after_bytes":0},
+ "ops":[{"k":"malloc","size":16},
+         {"k":"realloc","ref":0,"size":48},
+         {"k":"shrink","ref":0,"size":16},
+         {"k":"tryextend","ref":0,"size":32},
+         {"k":"message","size":8},
+         {"k":"strdup","size":3,"hex":"616263"},
+         {"k":"cleanup","ref":7}],
+ "free":true}
+```
+
+Ops: `malloc` (arena malloc of `size` bytes), `realloc` (arena realloc of the
+`ref` op's allocation to `size` — in place when it is the arena's last
+allocation, else a copy), `shrink` (in-place shrink of the last allocation),
+`tryextend` (extend in place only when last), `message` (zeroed malloc like
+`_upb_Message_New`), `strdup` (malloc + copy of the hex payload), `cleanup`
+(register an alloc-cleanup callback with a literal id). `free` requests the
+final `upb_Arena_Free` and reports which cleanups ran.
+
+Each op reports `ok`, `same_ptr` (the returned pointer equals the input),
+`extended`, `zeroed` (the region is all zeros — strdup/message semantics),
+`space` (`upb_Arena_SpaceAllocated`), and `ref`; the response ends with the
+final `arena.space`/`arena.fused_count` and the `cleanup` array (sorted;
+upstream fuses into the lower-address root, so cleanup ORDER is
+representation).
+
+## `arena_fuse`
+
+Creates two arenas (`a`, `b`; each with its own config and op script), fuses
+`b` into `a`, runs a post-fuse script on `b`, then frees both. Reports
+`is_fused`, per-op results, and the cleanup id arrays from each free:
+
+```json
+{"v":1,"id":1,"op":"arena_fuse",
+ "a":{"initial_block":0,"alloc":true,"max_block_size":0,"fail_after_bytes":0},
+ "a_ops":[{"k":"cleanup","ref":1}],
+ "b":{"initial_block":0,"alloc":true,"max_block_size":0,"fail_after_bytes":0},
+ "b_ops":[{"k":"cleanup","ref":2}],
+ "post_ops":[{"k":"malloc","size":8}]}
+```
+
+Fuse is refused when either arena has an initial block. Freeing the fused
+root decrements the refcount; only the final free runs the destructor and its
+cleanups.
+
+## `array_trace`
+
+Runs a scripted sequence of `upb_Array` ops (numeric ctypes only; string
+arrays hold pointer-valued StringView structs and are out of the court's
+scope). The request uses the generic op script shape:
+
+```json
+{"v":1,"id":1,"op":"array_trace",
+ "arena":{"initial_block":0,"alloc":true,"max_block_size":0,
+          "fail_after_bytes":0},
+ "ops":[{"k":"new","type":4},
+         {"k":"append","ref":0,"hex":"01000000"},
+         {"k":"set","ref":0,"index":0,"hex":"0a000000"},
+         {"k":"resize","ref":0,"size":2},
+         {"k":"get","ref":0,"index":0}]}
+```
+
+Ops: `new` (`type` is the `upb_CType`; the element-size lg2 derives from it),
+`append` (value bytes exactly `1 << lg2`), `set` (index + value bytes; under
+NDEBUG upstream writes regardless of `size` — a write at `size <= i <
+capacity` is invisible in the dump until growth), `resize` (`size` elements;
+grown elements are zero-filled by `upb_Array_Resize`), `get` (index; ok=false
+when out of bounds). Each op reports `ok`, `size`, the `data` hex over
+`size` elements, and `space`; the array's data region is a single arena
+allocation, so growth via arena realloc is observable in the accounting.
+
+## `map_trace`
+
+Runs a scripted sequence of `upb_Map` ops:
+
+```json
+{"v":1,"id":1,"op":"map_trace",
+ "arena":{"initial_block":0,"alloc":true,"max_block_size":0,
+          "fail_after_bytes":0},
+ "ops":[{"k":"new","key_type":4,"val_type":4},
+         {"k":"insert","ref":0,"hex":"01000000|1e000000"},
+         {"k":"get","ref":0,"hex":"01000000"},
+         {"k":"delete","ref":0,"hex":"01000000"},
+         {"k":"iterate","ref":0}]}
+```
+
+Ops: `new` (`key_type`/`val_type` are `upb_CType`s; 0 = string-typed),
+`insert` (key hex, then `|`, then value hex; last-wins — status
+`inserted`/`replaced`/`oom`), `get`/`delete` (key hex), `iterate` (all
+entries as `[keyhex, valhex]` pairs). Numeric keys/values must be exactly
+`key_size`/`val_size` bytes — the oracle's `value_from_hex` zero-fills on a
+width mismatch, so a malformed width is a protocol error. Iteration is
+reported **sorted** by the `keyhex|valhex` pair (upstream iteration order is
+table layout — representation). The map's internal table and its arena
+footprint are representation; `map_trace` reports content only.
 
 ## Extensions
 

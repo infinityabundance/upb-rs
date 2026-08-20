@@ -16,8 +16,10 @@
 //! This crate is the umbrella for the `upb-rs` workspace. It re-exports the
 //! individual subsystem crates:
 //!
-//! * [`core`](upb_rs_core) — wire constants and the upb error model
-//!   (`upb/wire/types.h`, `upb/base/error_handler.h` semantics)
+//! * [`core`](upb_rs_core) — wire constants, the upb error model, the arena,
+//!   and the array/map collection models (`upb/wire/types.h`,
+//!   `upb/base/error_handler.h`, `upb/mem/arena.*`, `upb/message/{array,map}.*`
+//!   semantics)
 //! * [`wire`](upb_rs_wire) — binary wire-format reader and message decode
 //!   (`upb_EpsCopyInputStream` + `upb_WireReader` + empty-mini-table decode)
 //! * [`mini_table`](upb_rs_mini_table) — mini descriptor decoding and the
@@ -39,8 +41,11 @@
 //!
 //! # Status
 //!
-//! Early development: wire-primitive decoding (varint/tag/size/fixed/skip)
-//! is under differential test against the pinned oracle. See
+//! Phase 1 (core representation + arena) is sealed: the arena, array, and map
+//! models are PARITY-SEALED against the real `upb_Arena` / `upb_Array` /
+//! `upb_Map` through the differential courts (see `courts/arena` and
+//! `courts/collections`). Wire decoding (primitives, empty-mini-table,
+//! known fields, linked sub-messages) is oracle-tested or sealed. See
 //! `STATUS.md` and `PARITY.toml` in the repository for the machine-readable
 //! claim manifest.
 

@@ -1,0 +1,12 @@
+[package]
+name = "court-arena"
+version = "0.1.0"
+edition = "2021"
+description = "Differential court: the Rust ArenaPool vs the real upb_Arena (allocation traces, growth, one-off blocks, OOM injection, fixed-size/initial-block modes, realloc identity, cleanup order, fuse lifetime)"
+
+[dependencies]
+upb-rs-casefile = { version = "0.1.0", path = "../../crates/upb-rs-casefile" }
+upb-rs-core = { version = "0.1.0", path = "../../crates/upb-rs-core" }
+upb-rs-oracle = { version = "0.1.3", path = "../../crates/upb-rs-oracle" }
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -27,7 +27,10 @@ cmake -S "$ROOT/third_party/protobuf" -B "$ROOT/third_party/build" $cmake_flags
 cmake --build "$ROOT/third_party/build" --target libupb -j"$(nproc)"
 
 mkdir -p "$ROOT/tools/oracle/build"
-cc -O2 -Wall -Wextra -I"$ROOT/third_party/protobuf" $extra_cflags \
+# -DNDEBUG matches the Release libupb build (the debug-only allocation-count
+# OOM injection symbols live only in debug libupb; the arena court injects OOM
+# through the controlled allocator instead).
+cc -DNDEBUG -O2 -Wall -Wextra -I"$ROOT/third_party/protobuf" $extra_cflags \
    -o "$ROOT/tools/oracle/build/oracle" \
    "$ROOT/tools/oracle/src/oracle.c" \
    "$ROOT/third_party/build/libupb.a" \

@@ -20,7 +20,9 @@ happy-path tests.
 | wire encode               | UNMAPPED      | —                                                     |
 | mini tables               | ORACLE-TESTED | courts/mini-table-inspect (701 cases, 0 residuals)  |
 | mini descriptors          | ORACLE-TESTED | courts/mini-table-inspect (701 cases, 0 residuals)  |
-| arena / memory            | MAPPED        | forensics/MEMORY_MODEL.md                             |
+| arena / memory            | PARITY-SEALED | courts/arena (61 cases, 0 residuals; forensics/MEMORY_MODEL.md) |
+| arrays                    | PARITY-SEALED | courts/collections (52 cases, 0 residuals; numeric ctypes) |
+| maps (content)            | PARITY-SEALED | courts/collections (52 cases, 0 residuals; iteration as sorted set) |
 | error model               | MAPPED        | forensics/ERROR_MODEL.md                              |
 | reflection                | UNMAPPED      | —                                                     |
 | JSON                      | UNMAPPED      | —                                                     |
@@ -33,15 +35,16 @@ happy-path tests.
 
 ## Current phase
 
-Phase 0 (archaeology + court infrastructure) is established; five courts are
+Phase 0 (archaeology + court infrastructure) is established; eight courts are
 live and sealed at 0 residuals over the charter boundary-length corpus:
 wire-primitives (1537), decode-empty (338), mini-table-inspect (701),
-decode-known (517), and decode-submsg (93). The decode-submsg court seals
-linked sub-message decode — singular merge semantics, repeated/nested/
-recursive sub-messages, depth budget boundaries (MaxDepthExceeded),
-truncations, size/budget overruns, unlinked slots — and caught two
-implementation defects on the way (the oneof-case-word dump regression,
-casefile oneof-case-word-dump; an oracle tooling validation bug). Next
-milestones per forensics/OPEN_QUESTIONS.md: maps, groups, and closed enums
-(with linked sub-enums), then the encoder court, and the schema synthesis
-engine.
+decode-known (517), decode-submsg (93), arena (61), and collections (52).
+Phase 1 (core representation + arena) is sealed: the ArenaPool, Array, and Map
+models are PARITY-SEALED against the real upb_Arena / upb_Array / upb_Map.
+The collections court exposed two tooling defects on the way (an oracle
+emitter bug — map iteration must start at kUpb_Map_Begin, otherwise entries
+hashing to slot 0 are skipped; and a corpus encoding bug — numeric map
+keys/values must be exactly key_size/val_size bytes, the DUT now enforces
+this loudly). Next milestones per forensics/OPEN_QUESTIONS.md: wire encode,
+maps-as-message-fields (MapEntry slot linking, _upb_Decoder_DecodeToMap),
+groups, and closed enums, then the schema synthesis engine.

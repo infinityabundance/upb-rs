@@ -1,0 +1,12 @@
+[package]
+name = "court-collections"
+version = "0.1.0"
+edition = "2021"
+description = "Differential court: upb_Array and upb_Map primitives (array arena accounting + content; map content semantics) vs the Rust Array/Map models"
+
+[dependencies]
+upb-rs-casefile = { version = "0.1.0", path = "../../crates/upb-rs-casefile" }
+upb-rs-core = { version = "0.1.0", path = "../../crates/upb-rs-core" }
+upb-rs-oracle = { version = "0.1.3", path = "../../crates/upb-rs-oracle" }
+serde = { workspace = true }
+serde_json = { workspace = true }

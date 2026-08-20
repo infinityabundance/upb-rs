@@ -25,6 +25,8 @@ members = [
     "courts/mini-table-inspect",
     "courts/decode-known",
     "courts/decode-submsg",
+    "courts/arena",
+    "courts/collections",
 ]
 
 [workspace.package]

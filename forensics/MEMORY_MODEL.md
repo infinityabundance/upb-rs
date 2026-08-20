@@ -126,6 +126,21 @@ differ in Rust), **[A]** ABI/layout (only needed for the C-compat phase),
   data (`message.c:59-69`). **[S]** — pointer identity observable; Rust must
   not relocate live allocations.
 
+### 1.7 Court verification (Phase 1)
+
+- The Rust model (`upb-rs-core::arena::ArenaPool` — handles over boxed,
+  8-aligned blocks, zero unsafe) is **PARITY-SEALED** against the real
+  `upb_Arena` by `courts/arena` (arena-v1, 61/61 equal, 0 residuals) over the
+  pinned oracle binary. The oracle's controlled exact-size allocator (OOM
+  injection via `fail_after_bytes`) makes block growth, one-off blocks, and
+  `space_allocated` accounting byte-observable; the DUT reproduces
+  `_upb_Arena_NextBlockSize`, `WouldReduceFreeSpace` (unsigned **wrapping**
+  subtraction), `UpdateGrowthState`, `_upb_Arena_SlowMalloc`, realloc
+  in-place/copy identity, shrink/try-extend last-alloc discipline, cleanup
+  registration, and fused-lifetime free. Fused cleanup ORDER is
+  representation (upstream fuses into the lower-address root; the court
+  compares sorted).
+
 ---
 
 ## 2. Message storage
@@ -297,6 +312,15 @@ is a hard failure L178-180), then `upb_Arena_Realloc` (in-place via
 `_upb_Array_TryFastRealloc` via `upb_Arena_TryExtend` (L114-123). `Resize`
 zeroes the grown region (`array.c:147-161`).
 
+> **Phase 1 court:** the Rust `Array` (header+data single arena allocation,
+> interior data-region realloc modeled as a sub-alloc) is PARITY-SEALED by
+> `courts/collections` (collections-v1, 52/52, 0 residuals): new/append/set/
+> resize/get with per-op data hex and space accounting. `upb_Array_Set` has
+> `UPB_ASSERT(i < size)` which NDEBUG builds compile out — upstream writes
+> regardless of `size`; the DUT mirrors this within capacity and REFUSES
+> `i >= capacity` (upstream heap overflow, §49 divergence). String arrays
+> (lg2=4, pointer-valued StringView content) are out of court scope.
+
 ### 4.2 `upb_Map` (`upb/message/internal/map.h:33-47`)
 
 ```c
@@ -324,6 +348,15 @@ structure preserving iteration/insert/delete semantics; map *order* is defined
 by hash layout, so iteration order is **not** part of the wire contract (only
 deterministic encode via `kUpb_EncodeOption_Deterministic` sorts separately,
 `upb/wire/encode.h:29-36`).
+
+> **Phase 1 court:** the Rust `Map` (content semantics only) is PARITY-SEALED
+> by `courts/collections` (collections-v1, 52/52, 0 residuals) over
+> insert/get/delete/iterate with bool/uint32/double/string keys and values
+> including hostile bit patterns; iteration is compared as a sorted set. The
+> oracle emitter initially started its iteration state at 0 instead of
+> `kUpb_Map_Begin` ((size_t)-1) — entries hashing to slot 0 were silently
+> skipped (hash/common.c `next()` increments before scanning); fixed and
+> regression-covered.
 
 ---
 
@@ -413,16 +446,16 @@ deterministic encode via `kUpb_EncodeOption_Deterministic` sorts separately,
 
 | Topic | Class | Rust constraint |
 |---|---|---|
-| Arena bump alloc, stable pointers, never move without explicit realloc | **S** | must hold |
-| Arena growth doubling / 128 start / 32768 cap / one-off blocks | **R** | observable only via `upb_Arena_SpaceAllocated` + allocator call counts — keep those numbers equivalent if instrumented |
+| Arena bump alloc, stable pointers, never move without explicit realloc | **S** | must hold — **COURTED**: arena-v1 (61/61) |
+| Arena growth doubling / 128 start / 32768 cap / one-off blocks | **R** | observable via `upb_Arena_SpaceAllocated` + allocator call counts — **COURTED** (arena-v1 keeps these numbers equivalent) |
 | `UPB_MALLOC_ALIGN`=8, ASAN guard, block header reserve | **R** | sanitizer-specific; not part of Rust kernel ABI |
-| Fuse/ref semantics (lifetime union, no initial-block fuse, refs between unfused arenas) | **S** | must hold (affects free-ordering observability) |
+| Fuse/ref semantics (lifetime union, no initial-block fuse, refs between unfused arenas) | **S** | must hold (affects free-ordering observability) — **COURTED**: arena-v1 (fuse refusal, fused free, cleanup sets) |
 | Message = single tagged internal pointer; aux_data of tagged ptrs | **R** | internal repr free; iteration order of unknowns/extensions is **S** (wire order) |
 | Presence bitmap in message body; hasbits required-first; oneof case words | **R** (**A** for C-compat) | offsets/bits matter only if Rust reads C-laid-out messages (ABI phase); `required` behavior is **S** |
 | `kUpb_Message_Align` = 8; minitable size aligned at build | **S** (size) / **R** (mechanics) | messages must be ≥8-aligned if C ABI |
 | No size classes, no 12/16-byte minimums | — | do not reintroduce |
 | MiniTable/Field/Sub/fasttable layouts | **R** | **A** only for C-compat phase; Rust may use its own schema repr |
-| Array/Map layouts, doubling growth, initial 4 | **R** | semantics (reserve/append/insert statuses, OOM on growth) are **S** |
+| Array/Map layouts, doubling growth, initial 4 | **R** | semantics (reserve/append/insert statuses, OOM on growth) are **S** — **COURTED**: collections-v1 (52/52) |
 | Unknown fields as StringView segments, coalescing | **R** | chunk boundaries after parse are **S** (visible via `upb_Message_NextUnknown` / `DeleteUnknown2`) |
 | String alias-vs-copy under `kUpb_DecodeOption_AliasString` | **S** | pointer identity of decoded strings observable; must alias when set |
 | Freeze bit and recursion | **S** | must match |

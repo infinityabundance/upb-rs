@@ -25,6 +25,8 @@
 
 #include "upb/base/status.h"
 #include "upb/mem/arena.h"
+#include "upb/message/array.h"
+#include "upb/message/map.h"
 #include "upb/message/message.h"
 #include "upb/message/unknown_fields.h"
 #include "upb/mini_descriptor/decode.h"
@@ -962,6 +964,876 @@ static void run_decode_submsg(int64_t id, const char* hex, int64_t depth,
 }
 
 // ---------------------------------------------------------------------------
+// Arena ops (court arena-v1): a controlled exact-size allocator with OOM
+// injection, scripted allocation traces against the real upb_Arena, fuse
+// lifetime merging, and alloc-cleanup observation.
+//
+// Build-configuration note: kUpb_MemblockReserve / kUpb_ArenaStateReserve /
+// kUpb_Asan_GuardSize are file-scope/private at this pin, so `arena_info`
+// reports the values for THIS build (64-bit release: reserve 16, state 80,
+// guard 0, align 8, max 32768). If the oracle is rebuilt with different
+// flags (ASAN adds a 32-byte guard; debug adds a refs member), update the
+// constants below.
+// ---------------------------------------------------------------------------
+
+#define ARENA_MAX_OPS 128
+#define ARENA_MAX_TAGGED 8
+
+// UPB_DEFAULT_MAX_BLOCK_SIZE is not exported by the upb headers the oracle
+// includes (def.inc undefs it); this is the value for this build (Linux).
+#define kOracleDefaultMaxBlockSize 32768UL
+
+// The controlled allocator fulfills every request exactly (no usable-size
+// rounding) and fails once the cumulative requested bytes would exceed
+// `fail_after` (0 = never). It is the deterministic counterpart to the DUT's
+// `ControlledAllocator`.
+typedef struct {
+  size_t total;       // cumulative requested bytes
+  size_t fail_after;  // 0 = never fail; else fail when total + size > fail_after
+} CtrlAllocState;
+
+static CtrlAllocState g_ctrl;
+
+static void* controlled_alloc_func(upb_alloc* alloc, void* ptr, size_t oldsize,
+                                   size_t size, size_t* actual_size) {
+  (void)alloc;
+  (void)oldsize;
+  if (size == 0) {
+    free(ptr);
+    return NULL;
+  }
+  if (g_ctrl.fail_after != 0 && g_ctrl.total + size > g_ctrl.fail_after) {
+    return NULL;
+  }
+  g_ctrl.total += size;
+  void* p = malloc(size);
+  if (actual_size) *actual_size = p ? size : 0;
+  return p;
+}
+
+// One upb_alloc per arena slot so the alloc-cleanup callback can identify
+// which arena's cleanup ran (upb_Arena_SetAllocCleanup receives the arena's
+// upb_alloc*).
+typedef struct {
+  upb_alloc alloc;
+  int64_t id;  // cleanup id for this slot, or -1
+} TaggedAlloc;
+
+static TaggedAlloc g_tagged[ARENA_MAX_TAGGED];
+static int64_t g_cleanup_order[ARENA_MAX_TAGGED];
+static int g_cleanup_n;
+
+static void arena_cleanup_func(upb_alloc* alloc) {
+  if (g_cleanup_n >= ARENA_MAX_TAGGED) return;
+  for (int i = 0; i < ARENA_MAX_TAGGED; i++) {
+    if (&g_tagged[i].alloc == alloc) {
+      g_cleanup_order[g_cleanup_n++] = g_tagged[i].id;
+      return;
+    }
+  }
+  g_cleanup_order[g_cleanup_n++] = -1;
+}
+
+typedef enum {
+  ARENA_OP_MALLOC,
+  ARENA_OP_REALLOC,
+  ARENA_OP_SHRINK,
+  ARENA_OP_TRYEXTEND,
+  ARENA_OP_MESSAGE,
+  ARENA_OP_STRDUP,
+  ARENA_OP_CLEANUP,
+} ArenaOpKind;
+
+typedef struct {
+  ArenaOpKind kind;
+  size_t size;
+  int ref;  // op index for realloc/shrink/tryextend; cleanup id for CLEANUP
+  char hex[4096];  // STRDUP payload
+} ArenaOp;
+
+static int json_bool(const char* line, const char* name, int* out) {
+  size_t nlen = strlen(name);
+  const char* p = strstr(line, name);
+  if (!p) return -1;
+  p += nlen;
+  while (*p && (*p == ' ' || *p == ':')) p++;
+  if (strncmp(p, "true", 4) == 0) {
+    *out = 1;
+    return 0;
+  }
+  if (strncmp(p, "false", 5) == 0) {
+    *out = 0;
+    return 0;
+  }
+  return -1;
+}
+
+// Parses an arena configuration object: {"initial_block":N,"alloc":bool,
+// "max_block_size":N,"fail_after_bytes":N}.
+static int parse_arena_cfg(const char* line, const char* key,
+                           size_t* initial_block, int* alloc,
+                           size_t* max_block_size, size_t* fail_after) {
+  size_t klen = strlen(key);
+  const char* p = strstr(line, key);
+  if (!p) return -1;
+  p += klen;
+  while (*p && (*p == ' ' || *p == ':')) p++;
+  if (*p != '{') return -1;
+  const char* end = strchr(p, '}');
+  if (!end) return -1;
+  size_t len = (size_t)(end - p + 1);
+  char buf[256];
+  if (len >= sizeof(buf)) return -1;
+  memcpy(buf, p, len);
+  buf[len] = '\0';
+  int64_t ib = 0, mb = 0, fa = 0;
+  json_int(buf, "\"initial_block\"", &ib);
+  json_int(buf, "\"max_block_size\"", &mb);
+  json_int(buf, "\"fail_after_bytes\"", &fa);
+  if (json_bool(buf, "\"alloc\"", alloc) < 0) *alloc = 1;
+  *initial_block = (size_t)ib;
+  *max_block_size = (size_t)mb;
+  *fail_after = (size_t)fa;
+  return 0;
+}
+
+// Parses an array of arena op objects: [{"k":"malloc","size":16,"ref":N,"hex":".."}, ...].
+static int parse_arena_ops(const char* line, const char* key, ArenaOp* ops,
+                           int max) {
+  size_t klen = strlen(key);
+  const char* p = strstr(line, key);
+  if (!p) return 0;
+  p += klen;
+  while (*p && (*p == ' ' || *p == ':')) p++;
+  if (*p != '[') return 0;
+  p++;
+  while (*p == ' ') p++;
+  if (*p == ']') return 0;  // empty array
+  int n = 0;
+  while (*p && n < max) {
+    while (*p && *p != '{' && *p != ']') p++;
+    if (*p != '{') break;  // ']' or end of string: array done
+    const char* end = strchr(p, '}');
+    if (!end) return -1;
+    size_t len = (size_t)(end - p + 1);
+    if (len > 4096) return -1;
+    char buf[4096];
+    memcpy(buf, p, len);
+    buf[len] = '\0';
+    char k[16] = {0};
+    int64_t size = 0, ref = -1;
+    if (json_string(buf, "\"k\"", k, sizeof(k)) < 0) return -1;
+    json_int(buf, "\"size\"", &size);
+    json_int(buf, "\"ref\"", &ref);
+    ArenaOp op;
+    memset(&op, 0, sizeof(op));
+    op.size = (size_t)size;
+    op.ref = (int)ref;
+    if (strcmp(k, "malloc") == 0) {
+      op.kind = ARENA_OP_MALLOC;
+    } else if (strcmp(k, "realloc") == 0) {
+      op.kind = ARENA_OP_REALLOC;
+    } else if (strcmp(k, "shrink") == 0) {
+      op.kind = ARENA_OP_SHRINK;
+    } else if (strcmp(k, "tryextend") == 0) {
+      op.kind = ARENA_OP_TRYEXTEND;
+    } else if (strcmp(k, "message") == 0) {
+      op.kind = ARENA_OP_MESSAGE;
+    } else if (strcmp(k, "strdup") == 0) {
+      op.kind = ARENA_OP_STRDUP;
+      json_string(buf, "\"hex\"", op.hex, sizeof(op.hex));
+    } else if (strcmp(k, "cleanup") == 0) {
+      op.kind = ARENA_OP_CLEANUP;
+    } else {
+      return -1;
+    }
+    ops[n++] = op;
+    p = end + 1;
+  }
+  return n;
+}
+
+// One op result: {"ok":bool,"space":N,"ref":i?,"same_ptr":?,"extended":?,"zeroed":?}.
+static void emit_arena_op(int ok, int same_ptr, int extended, int zeroed,
+                          uint64_t space, int ref) {
+  printf("{\"ok\":%s", ok ? "true" : "false");
+  if (same_ptr >= 0) printf(",\"same_ptr\":%s", same_ptr ? "true" : "false");
+  if (extended >= 0) printf(",\"extended\":%s", extended ? "true" : "false");
+  if (zeroed >= 0) printf(",\"zeroed\":%s", zeroed ? "true" : "false");
+  printf(",\"space\":%" PRIu64, space);
+  if (ref >= 0) printf(",\"ref\":%d", ref);
+  printf("}");
+}
+
+typedef struct {
+  upb_Arena* arena;
+  void* ptrs[ARENA_MAX_OPS];
+  size_t sizes[ARENA_MAX_OPS];
+  int slot;
+} ArenaCtx;
+
+// Runs one op list against an arena, emitting one result object per op.
+static void run_arena_ops(ArenaCtx* ctx, ArenaOp* ops, int n) {
+  for (int i = 0; i < n; i++) {
+    ArenaOp* op = &ops[i];
+    if (i) printf(",");
+    switch (op->kind) {
+      case ARENA_OP_MALLOC: {
+        void* p = upb_Arena_Malloc(ctx->arena, op->size);
+        ctx->ptrs[i] = p;
+        ctx->sizes[i] = op->size;
+        uint64_t space = upb_Arena_SpaceAllocated(ctx->arena, NULL);
+        emit_arena_op(p != NULL, -1, -1, -1, space, p ? i : -1);
+        break;
+      }
+      case ARENA_OP_REALLOC: {
+        void* r = upb_Arena_Realloc(ctx->arena, ctx->ptrs[op->ref],
+                                    ctx->sizes[op->ref], op->size);
+        int same = (r == ctx->ptrs[op->ref]);
+        ctx->ptrs[i] = r;
+        ctx->sizes[i] = op->size;
+        uint64_t space = upb_Arena_SpaceAllocated(ctx->arena, NULL);
+        emit_arena_op(r != NULL, same, -1, -1, space, r ? i : -1);
+        break;
+      }
+      case ARENA_OP_SHRINK:
+        upb_Arena_ShrinkLast(ctx->arena, ctx->ptrs[op->ref],
+                             ctx->sizes[op->ref], op->size);
+        ctx->sizes[op->ref] = op->size;
+        emit_arena_op(1, -1, -1, -1,
+                      upb_Arena_SpaceAllocated(ctx->arena, NULL), -1);
+        break;
+      case ARENA_OP_TRYEXTEND: {
+        int ok = upb_Arena_TryExtend(ctx->arena, ctx->ptrs[op->ref],
+                                     ctx->sizes[op->ref], op->size);
+        if (ok) ctx->sizes[op->ref] = op->size;
+        emit_arena_op(1, -1, ok, -1,
+                      upb_Arena_SpaceAllocated(ctx->arena, NULL), -1);
+        break;
+      }
+      case ARENA_OP_MESSAGE: {
+        void* p = upb_Arena_Malloc(ctx->arena, op->size);
+        if (p) memset(p, 0, op->size);  // _upb_Message_New zeroes
+        ctx->ptrs[i] = p;
+        ctx->sizes[i] = op->size;
+        uint64_t space = upb_Arena_SpaceAllocated(ctx->arena, NULL);
+        emit_arena_op(p != NULL, -1, -1, p != NULL, space, p ? i : -1);
+        break;
+      }
+      case ARENA_OP_STRDUP: {
+        size_t len = op->size;
+        void* p = upb_Arena_Malloc(ctx->arena, len);
+        if (p) {
+          uint8_t bytes[2048];
+          int bn = parse_hex(op->hex, strlen(op->hex), bytes, sizeof(bytes));
+          if (bn > 0) memcpy(p, bytes, (size_t)(bn < (int)len ? bn : (int)len));
+        }
+        ctx->ptrs[i] = p;
+        ctx->sizes[i] = len;
+        uint64_t space = upb_Arena_SpaceAllocated(ctx->arena, NULL);
+        emit_arena_op(p != NULL, -1, -1, -1, space, p ? i : -1);
+        break;
+      }
+      case ARENA_OP_CLEANUP:
+        g_tagged[ctx->slot].id = op->ref;
+        upb_Arena_SetAllocCleanup(ctx->arena, arena_cleanup_func);
+        emit_arena_op(1, -1, -1, -1,
+                      upb_Arena_SpaceAllocated(ctx->arena, NULL), -1);
+        break;
+    }
+  }
+}
+
+static void emit_cleanup_order(void) {
+  printf(",\"cleanup\":[");
+  for (int i = 0; i < g_cleanup_n; i++) {
+    if (i) printf(",");
+    printf("%" PRId64, g_cleanup_order[i]);
+  }
+  printf("]");
+}
+
+// Initializes an arena per the config; slot selects the TaggedAlloc. Returns
+// NULL (and emits an error response) on failure.
+static upb_Arena* init_arena_cfg(size_t initial_block, int alloc,
+                                 int slot, int64_t id, int* err_emitted) {
+  static uint8_t init_buf[4096];
+  g_tagged[slot].id = -1;
+  g_tagged[slot].alloc.func = controlled_alloc_func;
+  upb_alloc* al = alloc ? &g_tagged[slot].alloc : NULL;
+  upb_Arena* arena = NULL;
+  if (initial_block) {
+    if (initial_block > sizeof(init_buf)) {
+      emit_header(id, "error");
+      emit_field_str("code", "bad_request");
+      emit_end();
+      *err_emitted = 1;
+      return NULL;
+    }
+    arena = upb_Arena_Init(init_buf, initial_block, al);
+  } else {
+    arena = upb_Arena_Init(NULL, 0, al);
+  }
+  if (!arena) {
+    emit_header(id, "error");
+    emit_field_str("code", "init_failed");
+    emit_end();
+    *err_emitted = 1;
+    return NULL;
+  }
+  *err_emitted = 0;
+  return arena;
+}
+
+static void run_arena_trace(int64_t id, const char* line) {
+  size_t initial_block = 0, max_block_size = 0, fail_after = 0;
+  int alloc = 1;
+  if (parse_arena_cfg(line, "\"arena\"", &initial_block, &alloc,
+                      &max_block_size, &fail_after) < 0) {
+    emit_header(id, "error");
+    emit_field_str("code", "bad_request");
+    emit_end();
+    return;
+  }
+  ArenaOp ops[ARENA_MAX_OPS];
+  int n = parse_arena_ops(line, "\"ops\"", ops, ARENA_MAX_OPS);
+  if (n < 0) {
+    emit_header(id, "error");
+    emit_field_str("code", "bad_request");
+    emit_end();
+    return;
+  }
+  int free_at_end = 0;
+  json_bool(line, "\"free\"", &free_at_end);
+
+  g_ctrl.total = 0;
+  g_ctrl.fail_after = fail_after;
+  g_cleanup_n = 0;
+  if (max_block_size) upb_Arena_SetMaxBlockSize(max_block_size);
+
+  int err_emitted = 0;
+  upb_Arena* arena = init_arena_cfg(initial_block, alloc, 0, id, &err_emitted);
+  if (!arena) {
+    upb_Arena_SetMaxBlockSize(kOracleDefaultMaxBlockSize);
+    return;
+  }
+
+  emit_header(id, "ok");
+  printf(",\"ops\":[");
+  ArenaCtx ctx;
+  memset(&ctx, 0, sizeof(ctx));
+  ctx.arena = arena;
+  ctx.slot = 0;
+  run_arena_ops(&ctx, ops, n);
+  printf("]");
+  size_t fused = 0;
+  uint64_t space = upb_Arena_SpaceAllocated(arena, &fused);
+  printf(",\"arena\":{\"space\":%" PRIu64 ",\"fused_count\":%zu}",
+         space, fused);
+  if (free_at_end) {
+    upb_Arena_Free(arena);
+    emit_cleanup_order();
+  }
+  emit_end();
+  upb_Arena_SetMaxBlockSize(kOracleDefaultMaxBlockSize);
+}
+
+static void run_arena_fuse(int64_t id, const char* line) {
+  size_t ib_a = 0, mb_a = 0, fa_a = 0, ib_b = 0, mb_b = 0, fa_b = 0;
+  int alloc_a = 1, alloc_b = 1;
+  if (parse_arena_cfg(line, "\"a\"", &ib_a, &alloc_a, &mb_a, &fa_a) < 0 ||
+      parse_arena_cfg(line, "\"b\"", &ib_b, &alloc_b, &mb_b, &fa_b) < 0) {
+    emit_header(id, "error");
+    emit_field_str("code", "bad_request");
+    emit_end();
+    return;
+  }
+  ArenaOp ops_a[ARENA_MAX_OPS], ops_b[ARENA_MAX_OPS], ops_post[ARENA_MAX_OPS];
+  int na = parse_arena_ops(line, "\"a_ops\"", ops_a, ARENA_MAX_OPS);
+  int nb = parse_arena_ops(line, "\"b_ops\"", ops_b, ARENA_MAX_OPS);
+  int np = parse_arena_ops(line, "\"post_ops\"", ops_post, ARENA_MAX_OPS);
+  if (na < 0 || nb < 0 || np < 0) {
+    emit_header(id, "error");
+    emit_field_str("code", "bad_request");
+    emit_end();
+    return;
+  }
+  size_t max_block_size = mb_a ? mb_a : mb_b;
+
+  g_ctrl.total = 0;
+  g_ctrl.fail_after = fa_a ? fa_a : fa_b;
+  g_cleanup_n = 0;
+  if (max_block_size) upb_Arena_SetMaxBlockSize(max_block_size);
+
+  int err_emitted = 0;
+  upb_Arena* arena_a = init_arena_cfg(ib_a, alloc_a, 0, id, &err_emitted);
+  if (!arena_a) {
+    upb_Arena_SetMaxBlockSize(kOracleDefaultMaxBlockSize);
+    return;
+  }
+  upb_Arena* arena_b = init_arena_cfg(ib_b, alloc_b, 1, id, &err_emitted);
+  if (!arena_b) {
+    upb_Arena_SetMaxBlockSize(kOracleDefaultMaxBlockSize);
+    return;
+  }
+
+  emit_header(id, "ok");
+  printf(",\"a_ops\":[");
+  ArenaCtx ctx_a;
+  memset(&ctx_a, 0, sizeof(ctx_a));
+  ctx_a.arena = arena_a;
+  ctx_a.slot = 0;
+  run_arena_ops(&ctx_a, ops_a, na);
+  printf("]");
+  printf(",\"b_ops\":[");
+  ArenaCtx ctx_b;
+  memset(&ctx_b, 0, sizeof(ctx_b));
+  ctx_b.arena = arena_b;
+  ctx_b.slot = 1;
+  run_arena_ops(&ctx_b, ops_b, nb);
+  printf("]");
+
+  int fused = upb_Arena_Fuse(arena_a, arena_b);
+  printf(",\"is_fused\":%s", fused ? "true" : "false");
+  printf(",\"post_ops\":[");
+  run_arena_ops(&ctx_b, ops_post, np);
+  printf("]");
+  size_t fused_count = 0;
+  uint64_t space = upb_Arena_SpaceAllocated(arena_b, &fused_count);
+  printf(",\"arena\":{\"space\":%" PRIu64 ",\"fused_count\":%zu}",
+         space, fused_count);
+
+  upb_Arena_Free(arena_a);
+  printf(",\"free_a\":[");
+  for (int i = 0; i < g_cleanup_n; i++) {
+    if (i) printf(",");
+    printf("%" PRId64, g_cleanup_order[i]);
+  }
+  printf("]");
+  g_cleanup_n = 0;
+  upb_Arena_Free(arena_b);
+  printf(",\"free_b\":[");
+  for (int i = 0; i < g_cleanup_n; i++) {
+    if (i) printf(",");
+    printf("%" PRId64, g_cleanup_order[i]);
+  }
+  printf("]");
+  emit_end();
+  upb_Arena_SetMaxBlockSize(kOracleDefaultMaxBlockSize);
+}
+
+static void run_arena_info(int64_t id) {
+  // Constants for THIS build (64-bit release). See the section comment.
+  emit_header(id, "ok");
+  printf(",\"arena\":{\"malloc_align\":8,\"guard_size\":0,"
+         "\"memblock_reserve\":16,\"state_reserve\":80,"
+         "\"default_max_block_size\":32768}");
+  emit_end();
+}
+
+// ---------------------------------------------------------------------------
+// array_trace / map_trace (court collections-v1): scripted upb_Array and
+// upb_Map operations against the real APIs. The array ops report the arena
+// space (the array data region is a single arena allocation with observable
+// realloc growth); the map ops report content semantics only — the internal
+// table layout and arena footprint are representation (the DUT keeps entries
+// in owned storage).
+// ---------------------------------------------------------------------------
+
+typedef struct {
+  char k[16];
+  int64_t size;
+  int64_t ref;
+  int64_t index;
+  int64_t type;
+  int64_t key_type;
+  int64_t val_type;
+  char hex[4096];
+} GenOp;
+
+// Parses an array of generic op objects: [{"k":"...","size":N,"ref":N,
+// "index":N,"type":N,"key_type":N,"val_type":N,"hex":".."}, ...].
+static int parse_gen_ops(const char* line, const char* key, GenOp* ops,
+                         int max) {
+  size_t klen = strlen(key);
+  const char* p = strstr(line, key);
+  if (!p) return 0;
+  p += klen;
+  while (*p && (*p == ' ' || *p == ':')) p++;
+  if (*p != '[') return 0;
+  p++;
+  while (*p == ' ') p++;
+  if (*p == ']') return 0;
+  int n = 0;
+  while (*p && n < max) {
+    while (*p && *p != '{' && *p != ']') p++;
+    if (*p != '{') break;
+    const char* end = strchr(p, '}');
+    if (!end) return -1;
+    size_t len = (size_t)(end - p + 1);
+    if (len > 4096) return -1;
+    char buf[4096];
+    memcpy(buf, p, len);
+    buf[len] = '\0';
+    GenOp op;
+    memset(&op, 0, sizeof(op));
+    op.ref = -1;
+    if (json_string(buf, "\"k\"", op.k, sizeof(op.k)) < 0) return -1;
+    json_int(buf, "\"size\"", &op.size);
+    json_int(buf, "\"ref\"", &op.ref);
+    json_int(buf, "\"index\"", &op.index);
+    json_int(buf, "\"type\"", &op.type);
+    json_int(buf, "\"key_type\"", &op.key_type);
+    json_int(buf, "\"val_type\"", &op.val_type);
+    json_string(buf, "\"hex\"", op.hex, sizeof(op.hex));
+    ops[n++] = op;
+    p = end + 1;
+  }
+  return n;
+}
+
+// _upb_CType_SizeLg2 (mini_table/internal/size_log2.h:25-38), numeric ctypes
+// only (1..=9; string/bytes arrays hold StringView structs whose content is
+// pointer-valued and therefore out of the court's scope).
+static int ctype_lg2(int64_t ctype) {
+  switch (ctype) {
+    case 1: return 0;  // Bool
+    case 2: case 3: case 4: case 5: return 2;  // Float, Int32, UInt32, Enum
+    case 6: case 7: case 8: case 9: return 3;  // Message, Double, Int64, UInt64
+    default: return -1;
+  }
+}
+
+static void emit_collections_op(int ok, size_t sz, const upb_Array* arr,
+                                int lg2, upb_Arena* arena, int ref);
+
+static void run_array_trace(int64_t id, const char* line) {
+  size_t initial_block = 0, max_block_size = 0, fail_after = 0;
+  int alloc = 1;
+  if (parse_arena_cfg(line, "\"arena\"", &initial_block, &alloc,
+                      &max_block_size, &fail_after) < 0) {
+    emit_header(id, "error");
+    emit_field_str("code", "bad_request");
+    emit_end();
+    return;
+  }
+  GenOp ops[ARENA_MAX_OPS];
+  int n = parse_gen_ops(line, "\"ops\"", ops, ARENA_MAX_OPS);
+  if (n < 0) {
+    emit_header(id, "error");
+    emit_field_str("code", "bad_request");
+    emit_end();
+    return;
+  }
+  g_ctrl.total = 0;
+  g_ctrl.fail_after = fail_after;
+  if (max_block_size) upb_Arena_SetMaxBlockSize(max_block_size);
+
+  int err_emitted = 0;
+  upb_Arena* arena = init_arena_cfg(initial_block, alloc, 0, id, &err_emitted);
+  if (!arena) {
+    upb_Arena_SetMaxBlockSize(kOracleDefaultMaxBlockSize);
+    return;
+  }
+
+  upb_Array* arrays[ARENA_MAX_OPS] = {0};
+  int lgs[ARENA_MAX_OPS] = {0};
+
+  emit_header(id, "ok");
+  printf(",\"ops\":[");
+  for (int i = 0; i < n; i++) {
+    if (i) printf(",");
+    GenOp* op = &ops[i];
+    if (strcmp(op->k, "new") == 0) {
+      int lg2 = ctype_lg2(op->type);
+      upb_Array* arr = lg2 >= 0 ? upb_Array_New(arena, (upb_CType)op->type) : NULL;
+      arrays[i] = arr;
+      lgs[i] = lg2;
+      printf("{\"ok\":%s,\"size\":0,\"data\":\"\","
+             "\"space\":%" PRIu64,
+             arr ? "true" : "false",
+             (uint64_t)upb_Arena_SpaceAllocated(arena, NULL));
+      if (arr) printf(",\"ref\":%d", i);
+      printf("}");
+    } else if (strcmp(op->k, "append") == 0 || strcmp(op->k, "set") == 0) {
+      upb_Array* arr = arrays[op->ref];
+      int ok = 0;
+      if (arr) {
+        int lg2 = lgs[op->ref];
+        uint8_t bytes[16];
+        int bn = parse_hex(op->hex, strlen(op->hex), bytes, sizeof(bytes));
+        upb_MessageValue v;
+        memset(&v, 0, sizeof(v));
+        if (bn == (1 << lg2)) {
+          memcpy(&v, bytes, bn);
+          if (strcmp(op->k, "append") == 0) {
+            ok = upb_Array_Append(arr, v, arena);
+          } else {
+            upb_Array_Set(arr, (size_t)op->index, v);
+            ok = 1;
+          }
+        }
+      }
+      size_t sz = arr ? upb_Array_Size(arr) : 0;
+      emit_collections_op(ok, sz, arr, lgs[op->ref], arena, i);
+    } else if (strcmp(op->k, "resize") == 0) {
+      upb_Array* arr = arrays[op->ref];
+      int ok = arr && upb_Array_Resize(arr, (size_t)op->size, arena);
+      size_t sz = arr ? upb_Array_Size(arr) : 0;
+      emit_collections_op(ok, sz, arr, lgs[op->ref], arena, i);
+    } else if (strcmp(op->k, "get") == 0) {
+      upb_Array* arr = arrays[op->ref];
+      int ok = 0;
+      if (arr && (size_t)op->index < upb_Array_Size(arr)) {
+        upb_MessageValue v = upb_Array_Get(arr, (size_t)op->index);
+        printf("{\"ok\":true,\"val\":\"");
+        emit_hex_bytes((const unsigned char*)&v, (size_t)1 << lgs[op->ref]);
+        printf("\",\"space\":%" PRIu64 "}",
+               (uint64_t)upb_Arena_SpaceAllocated(arena, NULL));
+        continue;
+      }
+      printf("{\"ok\":%s,\"space\":%" PRIu64 "}", ok ? "true" : "false",
+             (uint64_t)upb_Arena_SpaceAllocated(arena, NULL));
+    } else {
+      printf("{\"ok\":false}");
+    }
+  }
+  printf("]");
+  size_t fused = 0;
+  uint64_t space = upb_Arena_SpaceAllocated(arena, &fused);
+  printf(",\"arena\":{\"space\":%" PRIu64 ",\"fused_count\":%zu}",
+         space, fused);
+  emit_end();
+  upb_Arena_SetMaxBlockSize(kOracleDefaultMaxBlockSize);
+}
+
+static void emit_collections_op(int ok, size_t sz, const upb_Array* arr,
+                                int lg2, upb_Arena* arena, int ref) {
+  printf("{\"ok\":%s,\"size\":%zu,\"data\":\"", ok ? "true" : "false",
+         sz);
+  if (arr) {
+    emit_hex_bytes((const unsigned char*)upb_Array_DataPtr(arr),
+                   sz << lg2);
+  }
+  printf("\",\"space\":%" PRIu64,
+         (uint64_t)upb_Arena_SpaceAllocated(arena, NULL));
+  if (ok && arr) printf(",\"ref\":%d", ref);
+  printf("}");
+}
+
+// Builds a upb_MessageValue from hex: numeric types memcpy the bytes; string
+// types (size 0) build a StringView into `buf`.
+static void value_from_hex(const char* hex, size_t size, uint8_t* buf,
+                           size_t buf_cap, upb_MessageValue* v) {
+  memset(v, 0, sizeof(*v));
+  int bn = parse_hex(hex, strlen(hex), buf, buf_cap);
+  if (size == 0) {
+    if (bn > 0) {
+      v->str_val = upb_StringView_FromDataAndSize((const char*)buf, (size_t)bn);
+    }
+  } else if (bn == (int)size) {
+    memcpy(v, buf, size);
+  }
+}
+
+static void run_map_trace(int64_t id, const char* line) {
+  size_t initial_block = 0, max_block_size = 0, fail_after = 0;
+  int alloc = 1;
+  if (parse_arena_cfg(line, "\"arena\"", &initial_block, &alloc,
+                      &max_block_size, &fail_after) < 0) {
+    emit_header(id, "error");
+    emit_field_str("code", "bad_request");
+    emit_end();
+    return;
+  }
+  GenOp ops[ARENA_MAX_OPS];
+  int n = parse_gen_ops(line, "\"ops\"", ops, ARENA_MAX_OPS);
+  if (n < 0) {
+    emit_header(id, "error");
+    emit_field_str("code", "bad_request");
+    emit_end();
+    return;
+  }
+  g_ctrl.total = 0;
+  g_ctrl.fail_after = fail_after;
+  if (max_block_size) upb_Arena_SetMaxBlockSize(max_block_size);
+
+  int err_emitted = 0;
+  upb_Arena* arena = init_arena_cfg(initial_block, alloc, 0, id, &err_emitted);
+  if (!arena) {
+    upb_Arena_SetMaxBlockSize(kOracleDefaultMaxBlockSize);
+    return;
+  }
+
+  upb_Map* maps[ARENA_MAX_OPS] = {0};
+  size_t key_sizes[ARENA_MAX_OPS] = {0};
+  size_t val_sizes[ARENA_MAX_OPS] = {0};
+  static uint8_t kbuf[ARENA_MAX_OPS][512];
+  static uint8_t vbuf[ARENA_MAX_OPS][512];
+
+  emit_header(id, "ok");
+  printf(",\"ops\":[");
+  for (int i = 0; i < n; i++) {
+    if (i) printf(",");
+    GenOp* op = &ops[i];
+    if (strcmp(op->k, "new") == 0) {
+      upb_Map* map = upb_Map_New(arena, (upb_CType)op->key_type,
+                                 (upb_CType)op->val_type);
+      maps[i] = map;
+      if (map) {
+        key_sizes[i] = map->key_size;
+        val_sizes[i] = map->val_size;
+      }
+      printf("{\"ok\":%s,\"size\":0", map ? "true" : "false");
+      if (map) printf(",\"ref\":%d", i);
+      printf("}");
+    } else if (strcmp(op->k, "insert") == 0) {
+      upb_Map* map = maps[op->ref];
+      int ok = 0;
+      if (map) {
+        upb_MessageValue key, val;
+        // The value hex follows a '|' separator inside op->hex for string
+        // values; for numeric values it is the same field. Split BEFORE
+        // parsing the key.
+        const char* vhex = op->hex;
+        char* sep = strchr(op->hex, '|');
+        if (sep) {
+          *sep = '\0';
+          vhex = sep + 1;
+        }
+        value_from_hex(op->hex, key_sizes[op->ref], kbuf[i], sizeof(kbuf[i]),
+                       &key);
+        value_from_hex(vhex, val_sizes[op->ref], vbuf[i], sizeof(vbuf[i]),
+                       &val);
+        upb_MapInsertStatus st =
+            upb_Map_Insert(map, key, val, arena);
+        printf("{\"ok\":true,\"status\":%s,\"size\":%zu}",
+               st == kUpb_MapInsertStatus_Inserted
+                   ? "\"inserted\""
+                   : (st == kUpb_MapInsertStatus_Replaced ? "\"replaced\""
+                                                          : "\"oom\""),
+               upb_Map_Size(map));
+        continue;
+      }
+      printf("{\"ok\":%s}", ok ? "true" : "false");
+    } else if (strcmp(op->k, "get") == 0) {
+      upb_Map* map = maps[op->ref];
+      int found = 0;
+      if (map) {
+        upb_MessageValue key, val;
+        value_from_hex(op->hex, key_sizes[op->ref], kbuf[i], sizeof(kbuf[i]),
+                       &key);
+        found = upb_Map_Get(map, key, &val);
+        if (found) {
+          printf("{\"ok\":true,\"found\":true,\"val\":\"");
+          if (val_sizes[op->ref] == 0) {
+            emit_hex_bytes((const unsigned char*)val.str_val.data,
+                           val.str_val.size);
+          } else {
+            emit_hex_bytes((const unsigned char*)&val, val_sizes[op->ref]);
+          }
+          printf("\"}");
+          continue;
+        }
+      }
+      printf("{\"ok\":true,\"found\":%s}", found ? "true" : "false");
+    } else if (strcmp(op->k, "delete") == 0) {
+      upb_Map* map = maps[op->ref];
+      int removed = 0;
+      if (map) {
+        upb_MessageValue key, val;
+        value_from_hex(op->hex, key_sizes[op->ref], kbuf[i], sizeof(kbuf[i]),
+                       &key);
+        removed = upb_Map_Delete(map, key, &val);
+        printf("{\"ok\":true,\"removed\":%s,\"size\":%zu}",
+               removed ? "true" : "false", upb_Map_Size(map));
+        continue;
+      }
+      printf("{\"ok\":%s}", removed ? "true" : "false");
+    } else if (strcmp(op->k, "iterate") == 0) {
+      upb_Map* map = maps[op->ref];
+      printf("{\"ok\":true,\"entries\":[");
+      if (map) {
+        // upb's table iterator advances BEFORE scanning (hash/common.c,
+        // `next()`), so the initial state must be kUpb_Map_Begin ((size_t)-1);
+        // starting at 0 silently skips any entry hashing to slot 0.
+        size_t iter = kUpb_Map_Begin;
+        upb_MessageValue key, val;
+        // Collect and sort by key bytes so the comparison is order-free
+        // (upstream iteration order is table layout, representation).
+        char collected[128][64];
+        size_t n_entries = 0;
+        while (upb_Map_Next(map, &key, &val, &iter) && n_entries < 128) {
+          // Build a comparable string of the pair: keyhex|valhex.
+          char tmp[64];
+          size_t o = 0;
+          if (key_sizes[op->ref] == 0) {
+            for (size_t j = 0; j < key.str_val.size && o + 1 < sizeof(tmp); j++) {
+              o += (size_t)sprintf(tmp + o, "%02x",
+                                   (unsigned char)key.str_val.data[j]);
+            }
+          } else {
+            for (size_t j = 0; j < key_sizes[op->ref] && o + 1 < sizeof(tmp); j++) {
+              o += (size_t)sprintf(tmp + o, "%02x",
+                                   ((const unsigned char*)&key)[j]);
+            }
+          }
+          if (o + 1 < sizeof(tmp)) tmp[o++] = '|';
+          if (val_sizes[op->ref] == 0) {
+            for (size_t j = 0; j < val.str_val.size && o + 1 < sizeof(tmp); j++) {
+              o += (size_t)sprintf(tmp + o, "%02x",
+                                   (unsigned char)val.str_val.data[j]);
+            }
+          } else {
+            for (size_t j = 0; j < val_sizes[op->ref] && o + 1 < sizeof(tmp); j++) {
+              o += (size_t)sprintf(tmp + o, "%02x",
+                                   ((const unsigned char*)&val)[j]);
+            }
+          }
+          tmp[o] = '\0';
+          memcpy(collected[n_entries], tmp, o + 1);
+          n_entries++;
+        }
+        // Simple insertion sort on the collected pair strings.
+        for (size_t a = 0; a < n_entries; a++) {
+          for (size_t b = a + 1; b < n_entries; b++) {
+            if (strcmp(collected[b], collected[a]) < 0) {
+              char t[64];
+              memcpy(t, collected[a], sizeof(t));
+              memcpy(collected[a], collected[b], sizeof(t));
+              memcpy(collected[b], t, sizeof(t));
+            }
+          }
+        }
+        for (size_t a = 0; a < n_entries; a++) {
+          if (a) printf(",");
+          // Re-derive the pair as a JSON array from the sorted string.
+          char* sep = strchr(collected[a], '|');
+          printf("[\"");
+          if (sep) {
+            *sep = '\0';
+            printf("%s", collected[a]);
+          }
+          printf("\",\"");
+          if (sep) printf("%s", sep + 1);
+          printf("\"]");
+        }
+      }
+      printf("]}");
+    } else {
+      printf("{\"ok\":false}");
+    }
+  }
+  printf("]");
+  size_t fused = 0;
+  uint64_t space = upb_Arena_SpaceAllocated(arena, &fused);
+  printf(",\"arena\":{\"space\":%" PRIu64 ",\"fused_count\":%zu}",
+         space, fused);
+  emit_end();
+  upb_Arena_SetMaxBlockSize(kOracleDefaultMaxBlockSize);
+}
+
+// ---------------------------------------------------------------------------
 // Main loop
 // ---------------------------------------------------------------------------
 
@@ -1053,6 +1925,16 @@ int main(void) {
         continue;
       }
       run_decode_submsg(id, hex, depth, mds, n_mds, links, link_lens);
+    } else if (strcmp(op, "arena_info") == 0) {
+      run_arena_info(id);
+    } else if (strcmp(op, "arena_trace") == 0) {
+      run_arena_trace(id, line);
+    } else if (strcmp(op, "arena_fuse") == 0) {
+      run_arena_fuse(id, line);
+    } else if (strcmp(op, "array_trace") == 0) {
+      run_array_trace(id, line);
+    } else if (strcmp(op, "map_trace") == 0) {
+      run_map_trace(id, line);
     } else {
       emit_header(id, "error");
       emit_field_str("code", "unknown_op");

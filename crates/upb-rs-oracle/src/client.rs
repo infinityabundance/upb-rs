@@ -84,6 +84,21 @@ impl OracleClient {
 
     /// Sends a request and returns the paired response.
     pub fn request(&mut self, req: &OracleRequest) -> Result<OracleResponse, OracleError> {
+        let value = self.request_value(req)?;
+        let resp: OracleResponse =
+            serde_json::from_value(value).map_err(|e| OracleError::Protocol(e.to_string()))?;
+        if resp.id != req.id {
+            return Err(OracleError::Unpaired {
+                expected: req.id,
+                got: resp.id,
+            });
+        }
+        Ok(resp)
+    }
+
+    /// Sends a request and returns the raw response JSON value (used by the
+    /// arena court, whose responses have their own shape).
+    pub fn request_value(&mut self, req: &OracleRequest) -> Result<serde_json::Value, OracleError> {
         let line = serde_json::to_string(req).map_err(|e| OracleError::Write(e.to_string()))?;
         writeln!(self.stdin, "{line}").map_err(|e| OracleError::Write(e.to_string()))?;
 
@@ -105,15 +120,7 @@ impl OracleClient {
             serde_json::Value::deserialize(&mut de)
                 .map_err(|e| OracleError::Protocol(e.to_string()))?
         };
-        let resp: OracleResponse =
-            serde_json::from_value(value).map_err(|e| OracleError::Protocol(e.to_string()))?;
-        if resp.id != req.id {
-            return Err(OracleError::Unpaired {
-                expected: req.id,
-                got: resp.id,
-            });
-        }
-        Ok(resp)
+        Ok(value)
     }
 
     /// Allocates a fresh id and sends a primitive read request.
@@ -158,6 +165,15 @@ impl OracleClient {
             md: None,
             mds: None,
             links: None,
+            arena: None,
+            ops: None,
+            gen_ops: None,
+            a: None,
+            a_ops: None,
+            b: None,
+            b_ops: None,
+            post_ops: None,
+            free: None,
         })?;
         if resp.echo.as_deref() != Some("pong") {
             return Err(OracleError::Protocol("ping did not return pong".into()));
@@ -191,6 +207,15 @@ impl OracleClient {
             md: None,
             mds: None,
             links: None,
+            arena: None,
+            ops: None,
+            gen_ops: None,
+            a: None,
+            a_ops: None,
+            b: None,
+            b_ops: None,
+            post_ops: None,
+            free: None,
         };
         self.request(&req)
     }
@@ -220,6 +245,57 @@ impl OracleClient {
         self.next_id += 1;
         let req = OracleRequest::decode_submsg(id, mds, links, payload, depth);
         self.request(&req)
+    }
+
+    /// Queries the oracle's arena build constants (arena_info).
+    pub fn arena_info(&mut self) -> Result<serde_json::Value, OracleError> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let req = OracleRequest::arena_info(id);
+        self.request_value(&req)
+    }
+
+    /// Runs an arena_trace script against the oracle (raw value response).
+    pub fn arena_trace(
+        &mut self,
+        arena: &crate::protocol::ArenaCfg,
+        ops: &[crate::protocol::ArenaOp],
+        free_at_end: bool,
+    ) -> Result<serde_json::Value, OracleError> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let req = OracleRequest::arena_trace(id, arena.clone(), ops, free_at_end);
+        self.request_value(&req)
+    }
+
+    /// Runs an arena_fuse script against the oracle (raw value response).
+    pub fn arena_fuse(
+        &mut self,
+        cfg_a: &crate::protocol::ArenaCfg,
+        cfg_b: &crate::protocol::ArenaCfg,
+        ops_a: &[crate::protocol::ArenaOp],
+        ops_b: &[crate::protocol::ArenaOp],
+        ops_post: &[crate::protocol::ArenaOp],
+    ) -> Result<serde_json::Value, OracleError> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let req =
+            OracleRequest::arena_fuse(id, cfg_a.clone(), cfg_b.clone(), ops_a, ops_b, ops_post);
+        self.request_value(&req)
+    }
+
+    /// Runs an array_trace / map_trace script against the oracle (raw value
+    /// response). `op` names the oracle op ("array_trace" / "map_trace").
+    pub fn arena_trace_request(
+        &mut self,
+        op: &str,
+        arena: &crate::protocol::ArenaCfg,
+        ops: &[crate::protocol::GenOp],
+    ) -> Result<serde_json::Value, OracleError> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let req = OracleRequest::gen_trace(id, op, arena.clone(), ops);
+        self.request_value(&req)
     }
 }
 
