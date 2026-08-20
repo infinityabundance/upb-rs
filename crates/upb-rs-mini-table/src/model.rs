@@ -97,6 +97,37 @@ pub const EXT_EXTENDABLE: u8 = 1;
 pub const EXT_MESSAGE_SET: u8 = 2;
 pub const EXT_MAP_ENTRY: u8 = 4;
 
+/// `struct upb_MiniTableEnum` (mini_table/internal/enum.h:15-21): the valid
+/// values of a closed enum as a 32-bit mask up to `mask_limit` plus a sparse
+/// tail of enumerated values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MiniTableEnum {
+    pub mask_limit: u32,
+    pub value_count: u32,
+    pub data: Vec<u32>,
+}
+
+impl MiniTableEnum {
+    /// `upb_MiniTableEnum_CheckValue` (internal/enum.h:25-43): values below 64
+    /// test the two-word mask; below mask_limit the per-word mask; larger
+    /// values scan the sparse tail.
+    pub fn check_value(&self, val: u32) -> bool {
+        if val < 64 {
+            let mask = (self.data[0] as u64) | ((self.data[1] as u64) << 32);
+            let bit = 1u64 << val;
+            return (mask & bit) != 0;
+        }
+        if val < self.mask_limit {
+            let mask = self.data[(val / 32) as usize];
+            let bit = 1u32 << (val % 32);
+            return (mask & bit) != 0;
+        }
+        let start = (self.mask_limit / 32) as usize;
+        let limit = start + self.value_count as usize;
+        self.data[start..limit].contains(&val)
+    }
+}
+
 /// The built mini table (`struct upb_MiniTable`, message.h:71-94), projected
 /// to the observable fields. `table_mask`/fasttable entries are excluded:
 /// they are a performance artifact with no observable decode semantics (the

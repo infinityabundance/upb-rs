@@ -50,7 +50,7 @@
 
 use std::collections::HashMap;
 
-use upb_rs_mini_table::model::{FieldMode, MiniTable, MiniTableField, NO_SUB};
+use upb_rs_mini_table::model::{FieldMode, MiniTable, MiniTableEnum, MiniTableField, NO_SUB};
 
 use crate::reader;
 use crate::stream::EpsCopyStream;
@@ -203,14 +203,25 @@ fn prepare_singular_submsg(msg: &mut Message, f: &MiniTableField) -> bool {
     }
 }
 
+/// A pool entry: a message table or a closed-enum table (the pool index is
+/// what `links[t][s]` refers to).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PoolKind {
+    Message(usize),
+    Enum(usize),
+}
+
 /// A pool of mini tables with linked sub-slots (the mini-descriptor analog of
 /// upstream's table pool + `upb_MiniTable_Link`). Sub slots are assigned in
 /// field order during build (`set_type_and_sub`, decode.rs:364-369), so slot
 /// `s` of table `t` is the `s`-th field of `t` carrying a sub slot
-/// (`submsg_ofs != NO_SUB`); `links[t][s]` is the target table index.
+/// (`submsg_ofs != NO_SUB`); `links[t][s]` is the target pool index (a
+/// message table or an enum table).
 #[derive(Debug, Clone)]
 pub struct TableSet {
     tables: Vec<MiniTable>,
+    enums: Vec<MiniTableEnum>,
+    pool: Vec<PoolKind>,
     links: Vec<Vec<usize>>,
 }
 
@@ -223,25 +234,46 @@ impl TableSet {
             .map_err(|_| KnownDecodeError::Unsupported("minitable"))?;
         Ok(TableSet {
             tables: vec![mt],
+            enums: Vec::new(),
+            pool: vec![PoolKind::Message(0)],
             links: vec![Vec::new()],
         })
     }
 
     /// Builds a pool from `mds` (main at index 0) and links sub slots by
-    /// `links[t][s]` = target table index. Missing/out-of-range entries leave
-    /// the slot unlinked (unknown-field behavior, as upstream).
+    /// `links[t][s]` = target pool index. A `!`-versioned descriptor builds a
+    /// closed-enum table (`upb_MiniTableEnum_Build`); anything else a message
+    /// table. Missing/out-of-range entries leave the slot unlinked
+    /// (unknown-field behavior, as upstream).
     pub fn from_pool(mds: &[&[u8]], links: &[&[usize]]) -> Result<TableSet> {
         let mut tables = Vec::with_capacity(mds.len());
+        let mut enums: Vec<MiniTableEnum> = Vec::new();
+        let mut pool: Vec<PoolKind> = Vec::with_capacity(mds.len());
         for md in mds {
-            let (mt, _) = upb_rs_mini_table::decode::build_mini_table(md)
-                .map_err(|_| KnownDecodeError::Unsupported("minitable"))?;
-            tables.push(mt);
+            if md.first() == Some(&b'!') {
+                let e = upb_rs_mini_table::decode::build_mini_table_enum(md)
+                    .map_err(|_| KnownDecodeError::Unsupported("enum"))?;
+                pool.push(PoolKind::Enum(enums.len()));
+                enums.push(e);
+            } else {
+                let (mt, _) = upb_rs_mini_table::decode::build_mini_table(md)
+                    .map_err(|_| KnownDecodeError::Unsupported("minitable"))?;
+                pool.push(PoolKind::Message(tables.len()));
+                tables.push(mt);
+            }
         }
-        // `upb_MiniTable_SetSubMessage` (mini_descriptor/link.c:43-60):
-        // linking a field to a map-entry table (ext & kUpb_ExtMode_IsMapEntry)
-        // flips the field's mode bits to kUpb_FieldMode_Map (0). The slot
-        // order is field order (the same walk `sub()` uses).
+        // `upb_MiniTable_SetSubMessage` (mini_descriptor/link.c:39-97) and
+        // `upb_MiniTable_SetSubEnum` (link.c:99-126): the observable link
+        // contract. Linking a field to a map-entry table (ext &
+        // kUpb_ExtMode_IsMapEntry) flips the field's mode bits to
+        // kUpb_FieldMode_Map (0); a kind mismatch between the field type and
+        // the target (enum field -> message table, message/group field ->
+        // enum table, group field -> map entry, map entry inside a map
+        // entry) makes the setter return false, which is a build failure
+        // upstream (the oracle reports link_failed). The slot order is field
+        // order (the same walk `sub()` uses).
         for t in 0..tables.len() {
+            let table_is_map = tables[t].ext & upb_rs_mini_table::model::EXT_MAP_ENTRY != 0;
             let mut slot = 0usize;
             for i in 0..tables[t].fields.len() {
                 if tables[t].fields[i].submsg_ofs == NO_SUB {
@@ -249,23 +281,85 @@ impl TableSet {
                 }
                 let target = links.get(t).and_then(|l| l.get(slot)).copied();
                 slot += 1;
-                if let Some(target) = target {
-                    if target < tables.len()
-                        && tables[target].ext & upb_rs_mini_table::model::EXT_MAP_ENTRY != 0
-                    {
-                        tables[t].fields[i].mode &= !0x3; // kUpb_FieldMode_Map == 0
+                let Some(target) = target else {
+                    continue; // no link provided: the slot stays unlinked
+                };
+                let field_type = tables[t].fields[i].descriptortype;
+                match pool.get(target) {
+                    // `upb_MiniTable_SetSubEnum` (link.c:99-126): only Enum
+                    // fields link to enum tables, and an enum used in a map
+                    // entry must include 0 (protoc guarantees this).
+                    Some(PoolKind::Enum(ei)) => {
+                        if field_type != 14 {
+                            return Err(KnownDecodeError::Unsupported(
+                                "link: enum target for non-enum field",
+                            ));
+                        }
+                        if table_is_map && !enums[*ei].check_value(0) {
+                            return Err(KnownDecodeError::Unsupported(
+                                "link: map-entry enum must include 0",
+                            ));
+                        }
+                    }
+                    // `upb_MiniTable_SetSubMessage` (link.c:39-97).
+                    Some(PoolKind::Message(mi)) => {
+                        let sub_is_map =
+                            tables[*mi].ext & upb_rs_mini_table::model::EXT_MAP_ENTRY != 0;
+                        match field_type {
+                            10 => {
+                                if sub_is_map {
+                                    return Err(KnownDecodeError::Unsupported(
+                                        "link: group field to map entry",
+                                    ));
+                                }
+                            }
+                            11 => {
+                                if sub_is_map {
+                                    if table_is_map {
+                                        return Err(KnownDecodeError::Unsupported(
+                                            "link: map entry inside map entry",
+                                        ));
+                                    }
+                                    tables[t].fields[i].mode &= !0x3; // kUpb_FieldMode_Map == 0
+                                }
+                            }
+                            _ => {
+                                return Err(KnownDecodeError::Unsupported(
+                                    "link: message target for non-message field",
+                                ));
+                            }
+                        }
+                    }
+                    // A link target outside the pool is a build failure
+                    // upstream (the oracle reports bad_links).
+                    None => {
+                        return Err(KnownDecodeError::Unsupported("link: target out of range"));
                     }
                 }
             }
         }
         Ok(TableSet {
             tables,
+            enums,
+            pool,
             links: links.iter().map(|l| l.to_vec()).collect(),
         })
     }
 
     pub fn table(&self, idx: usize) -> &MiniTable {
-        &self.tables[idx]
+        match &self.pool[idx] {
+            PoolKind::Message(i) => &self.tables[*i],
+            PoolKind::Enum(_) => panic!("table() on an enum pool entry"),
+        }
+    }
+
+    /// The linked closed-enum table for the pool index, or None for a message
+    /// pool entry.
+    pub fn enum_table(&self, idx: usize) -> Option<&MiniTableEnum> {
+        match self.pool.get(idx) {
+            Some(PoolKind::Enum(i)) => self.enums.get(*i),
+            _ => None,
+        }
     }
 
     /// The main (index-0) table.
@@ -273,20 +367,38 @@ impl TableSet {
         &self.tables[0]
     }
 
-    /// The linked sub-table index for the field at `field_index` of
-    /// `table_idx`, or None when the slot is unlinked.
-    pub fn sub(&self, table_idx: usize, field_index: usize) -> Option<usize> {
+    /// The sub-slot index of the field at `field_index` of `table_idx` (the
+    /// count of sub-carrying fields up to and including it, minus one).
+    fn slot_of(&self, table_idx: usize, field_index: usize) -> Option<usize> {
         let mt = &self.tables[table_idx];
-        let slot = mt.fields[..=field_index]
+        mt.fields[..=field_index]
             .iter()
             .filter(|f| f.submsg_ofs != NO_SUB)
             .count()
-            .checked_sub(1)?;
-        self.links
-            .get(table_idx)
-            .and_then(|l| l.get(slot))
-            .copied()
-            .filter(|&t| t < self.tables.len())
+            .checked_sub(1)
+    }
+
+    /// The linked sub-table pool index for the field at `field_index` of
+    /// `table_idx`, or None when the slot is unlinked or targets an enum
+    /// table (message/group/map-entry sub slots).
+    pub fn sub(&self, table_idx: usize, field_index: usize) -> Option<usize> {
+        let slot = self.slot_of(table_idx, field_index)?;
+        let target = self.links.get(table_idx)?.get(slot).copied()?;
+        match self.pool.get(target) {
+            Some(PoolKind::Message(_)) => Some(target),
+            _ => None,
+        }
+    }
+
+    /// The linked closed-enum table pool index for the field, or None when
+    /// the slot is unlinked or targets a message table.
+    pub fn sub_enum(&self, table_idx: usize, field_index: usize) -> Option<usize> {
+        let slot = self.slot_of(table_idx, field_index)?;
+        let target = self.links.get(table_idx)?.get(slot).copied()?;
+        match self.pool.get(target) {
+            Some(PoolKind::Enum(_)) => Some(target),
+            _ => None,
+        }
     }
 }
 
@@ -504,7 +616,7 @@ fn elem_size(field_type: u8) -> usize {
 /// `$3` + `0a00`). Groups and maps are deferred (rejected defensively).
 pub fn decode_known(descriptor: &[u8], input: &[u8], max_depth: u32) -> Result<Message> {
     let ts = TableSet::from_single(descriptor)?;
-    reject_deferred(ts.main())?;
+    reject_deferred(&ts)?;
     let depth = effective_depth(max_depth);
     let mut msg = Message::new(ts.main().size as usize);
     let mut stream = EpsCopyStream::init(input);
@@ -525,7 +637,7 @@ pub fn decode_submsg(
     max_depth: u32,
 ) -> Result<Message> {
     let ts = TableSet::from_pool(mds, links)?;
-    reject_deferred(ts.main())?;
+    reject_deferred(&ts)?;
     let depth = effective_depth(max_depth);
     let mut msg = Message::new(ts.main().size as usize);
     let mut stream = EpsCopyStream::init(input);
@@ -534,12 +646,24 @@ pub fn decode_submsg(
     Ok(msg)
 }
 
-fn reject_deferred(mt: &MiniTable) -> Result<()> {
-    // All encoded types are supported at this surface. (Groups decode
-    // through their linked sub tables; unlinked sub-slots decode as unknown
-    // fields, matching upstream's contract.)
-    let _ = mt;
+fn reject_deferred(ts: &TableSet) -> Result<()> {
+    // All encoded types are supported at this surface except closed-enum
+    // fields whose enum table is unlinked (upstream dereferences a NULL sub
+    // and crashes — UB; §49). The corpus always links closed enums.
+    for t in 0..ts.tables.len() {
+        for (i, f) in ts.tables[t].fields.iter().enumerate() {
+            if is_closed_enum(f) && ts.sub_enum(t, i).is_none() {
+                return Err(KnownDecodeError::Unsupported("unlinked closed enum"));
+            }
+        }
+    }
     Ok(())
+}
+
+/// `upb_MiniTableField_IsClosedEnum`: descriptortype Enum (14) without the
+/// IsAlternate flag (open enums are rewritten to Int32 with IsAlternate).
+fn is_closed_enum(f: &MiniTableField) -> bool {
+    f.descriptortype == 14 && !f.is_alternate()
 }
 
 fn effective_depth(max_depth: u32) -> i32 {
@@ -650,12 +774,49 @@ fn decode_message(
                 if size as i64 > input.len() as i64 - span_start as i64 {
                     return Err(KnownDecodeError::Malformed);
                 }
-                let elems = parse_packed_varints(input, span_start, span_start + size, f, lg2)?;
+                if is_closed_enum(f) {
+                    // `_upb_Decoder_DecodeEnumPacked` (decode.c:315-347):
+                    // each varint is checked against the enum table; an
+                    // invalid value is re-encoded as [varint tag][minimal
+                    // varint] into the message's unknowns (AddEnumValueToUnknown),
+                    // a valid one stored as int32.
+                    let enum_idx = ts.sub_enum(table_idx, field_index.expect("packed enum"));
+                    let e = enum_idx
+                        .and_then(|i| ts.enum_table(i))
+                        .expect("linked enum");
+                    let arr = msg.arrays.entry(f.number as usize).or_default();
+                    let mut pos = span_start;
+                    let end = span_start + size;
+                    while pos < end {
+                        // read_packed_varint returns the consumed position
+                        // (like `upb_WireReader_ReadVarint` returning a new
+                        // pointer), so assign rather than add. A varint whose
+                        // termination passes the payload end overruns the
+                        // pushed limit: the next `IsDone` errors upstream
+                        // (decode.c:298, 1010-1081) — same classification as
+                        // `parse_packed_varints`.
+                        let (v, n) = read_packed_varint(input, pos, end)?;
+                        pos = n;
+                        if pos > end {
+                            return Err(KnownDecodeError::Malformed);
+                        }
+                        if e.check_value(v as u32) {
+                            arr.push((v as u32).to_le_bytes().to_vec());
+                        } else {
+                            let mut seg = Vec::with_capacity(11);
+                            encode_varint(&mut seg, (f.number as u64) << 3);
+                            encode_varint(&mut seg, v);
+                            msg.unknown.extend(seg);
+                        }
+                    }
+                } else {
+                    let elems = parse_packed_varints(input, span_start, span_start + size, f, lg2)?;
+                    msg.arrays
+                        .entry(f.number as usize)
+                        .or_default()
+                        .extend(elems);
+                }
                 *ptr += size;
-                msg.arrays
-                    .entry(f.number as usize)
-                    .or_default()
-                    .extend(elems);
             }
             Op::FixedPacked(lg2) => {
                 let size = value.expect("delimited size") as usize;
@@ -891,6 +1052,23 @@ fn decode_wire_value(
     match wire_type {
         0 => {
             let v = reader::read_varint(stream, ptr).map_err(|_| KnownDecodeError::Malformed)?;
+            if is_closed_enum(field) {
+                // `_upb_Decoder_DecodeWireValue` (decode.c:889-901): the value
+                // is checked against the linked enum table; an invalid value
+                // becomes an unknown field (the consumed span is captured raw,
+                // so overlong encodings are preserved).
+                let valid = match ts.sub_enum(table_idx, field_index) {
+                    Some(e) => ts
+                        .enum_table(e)
+                        .is_some_and(|t| t.check_value(v.value as u32)),
+                    None => false,
+                };
+                if !valid {
+                    return Ok((Op::Unknown, Some(v.value), v.consumed));
+                }
+                // Valid: munge like Int32 (`_upb_Decoder_MungeInt32`).
+                return Ok((Op::Scalar4, Some(v.value), v.consumed));
+            }
             let op = if is_varint_type(field.descriptortype) {
                 scalar_op(field)
             } else {
@@ -2132,5 +2310,187 @@ mod tests {
             100,
         );
         assert!(matches!(e, Err(KnownDecodeError::Malformed)));
+    }
+
+    /// A { E e = 1; } ($4) with E { 1, 2 } (!(). A valid value stores as
+    /// int32; an invalid value becomes an unknown field with the RAW wire
+    /// span (overlong encodings preserved); an overlong VALID value stores
+    /// the munged value.
+    #[test]
+    fn closed_enum_scalar() {
+        // Valid value 1.
+        let m = dsub(&["2434", "2128"], &[&[1], &[]], &[0x08, 0x01], 100).unwrap();
+        assert_eq!(m.buf[12..16], 1u32.to_le_bytes());
+        assert!(m.unknown.is_empty());
+        // Invalid value 5.
+        let m = dsub(&["2434", "2128"], &[&[1], &[]], &[0x08, 0x05], 100).unwrap();
+        assert_eq!(m.buf[12..16], 0u32.to_le_bytes());
+        assert_eq!(m.unknown, [0x08, 0x05]);
+        // Invalid overlong value 5: raw span preserved.
+        let m = dsub(&["2434", "2128"], &[&[1], &[]], &[0x08, 0x85, 0x00], 100).unwrap();
+        assert_eq!(m.unknown, [0x08, 0x85, 0x00]);
+        // Overlong VALID value 1: stored as 1.
+        let m = dsub(&["2434", "2128"], &[&[1], &[]], &[0x08, 0x81, 0x00], 100).unwrap();
+        assert_eq!(m.buf[12..16], 1u32.to_le_bytes());
+        assert!(m.unknown.is_empty());
+    }
+
+    /// Repeated closed enum: invalid unpacked elements become unknown fields
+    /// (raw capture); packed invalid elements are re-encoded as
+    /// [varint tag][minimal varint].
+    #[test]
+    fn closed_enum_repeated_packed() {
+        // $H = A { repeated E e = 1; }. Unpacked {1, 5} -> [1], unknown 0805.
+        let m = dsub(
+            &["2448", "2128"],
+            &[&[1], &[]],
+            &[0x08, 0x01, 0x08, 0x05],
+            100,
+        )
+        .unwrap();
+        assert_eq!(
+            m.arrays.get(&1).unwrap(),
+            &vec![1u32.to_le_bytes().to_vec()]
+        );
+        assert_eq!(m.unknown, [0x08, 0x05]);
+        // Packed {1, 5} -> [1], unknown 0805 (re-encoded).
+        let m = dsub(
+            &["2448", "2128"],
+            &[&[1], &[]],
+            &[0x0A, 0x02, 0x01, 0x05],
+            100,
+        )
+        .unwrap();
+        assert_eq!(
+            m.arrays.get(&1).unwrap(),
+            &vec![1u32.to_le_bytes().to_vec()]
+        );
+        assert_eq!(m.unknown, [0x08, 0x05]);
+        // Packed overlong invalid {85 00} -> re-encoded minimal 0805.
+        let m = dsub(
+            &["2448", "2128"],
+            &[&[1], &[]],
+            &[0x0A, 0x02, 0x85, 0x00],
+            100,
+        )
+        .unwrap();
+        assert!(m.arrays.get(&1).is_none_or(|a| a.is_empty()));
+        assert_eq!(m.unknown, [0x08, 0x05]);
+        // Packed all-invalid {5, 6} -> two re-encodes.
+        let m = dsub(
+            &["2448", "2128"],
+            &[&[1], &[]],
+            &[0x0A, 0x02, 0x05, 0x06],
+            100,
+        )
+        .unwrap();
+        assert_eq!(m.unknown, [0x08, 0x05, 0x08, 0x06]);
+    }
+
+    /// An unlinked closed enum is rejected defensively (upstream dereferences
+    /// a NULL sub — UB; §49).
+    #[test]
+    fn closed_enum_unlinked_rejected() {
+        let e = dsub(&["2434", "2128"], &[&[], &[]], &[0x08, 0x01], 100);
+        assert!(matches!(e, Err(KnownDecodeError::Unsupported(_))));
+    }
+
+    /// A closed enum as a map VALUE: an invalid value makes the entry carry an
+    /// unknown, so the whole entry is re-encoded under the map field's tag.
+    /// (The entry enum must include 0 per SetSubEnum's map-entry rule.)
+    #[test]
+    fn closed_enum_map_value() {
+        // E { 0, 1 } = !$ ; entry %)! = UInt32 key + ClosedEnum val.
+        let m = dsub(
+            &["2433", "252934", "2124"],
+            &[&[1], &[2], &[]],
+            &[0x0A, 0x04, 0x08, 0x05, 0x10, 0x01], // {key:5, val:1} valid
+            100,
+        )
+        .unwrap();
+        let entries = m.maps.get(&1).expect("map");
+        assert_eq!(entries.len(), 1);
+        match &entries[0].value {
+            MapValue::Scalar(v) => assert_eq!(v, &1u32.to_le_bytes()),
+            _ => panic!("scalar value"),
+        }
+        // {key:5, val:5} invalid -> entry not inserted; re-encoded under tag.
+        let m = dsub(
+            &["2433", "252934", "2124"],
+            &[&[1], &[2], &[]],
+            &[0x0A, 0x04, 0x08, 0x05, 0x10, 0x05],
+            100,
+        )
+        .unwrap();
+        assert!(!m.maps.contains_key(&1));
+        // Entry re-encode: key present, val absent (invalid -> unknown inside
+        // the entry) -> payload = 0805 (key) + 1005 (the unknown val span).
+        assert_eq!(m.unknown, [0x0A, 0x04, 0x08, 0x05, 0x10, 0x05]);
+    }
+
+    /// Negative closed-enum values: the wire carries a 10-byte sign-extended
+    /// varint; CheckValue truncates the u64 to u32 (`upb_MiniTableEnum_CheckValue`
+    /// takes uint32_t, enum.h:26-27), so -1 matches a table holding
+    /// 0xFFFFFFFF and stores the low 32 bits.
+    #[test]
+    fn closed_enum_negative() {
+        // E { 0xFFFFFFFF } = '!' + skip varint + mask bit 0 (sparse tail).
+        let mut desc = vec![b'!'];
+        upb_rs_mini_table::base92::encode_varint(&mut desc, 0xFFFF_FFFF, b'_', b'~');
+        desc.push(upb_rs_mini_table::base92::to_base92(1));
+        let hex: String = desc.iter().map(|b| format!("{b:02x}")).collect();
+        // Wire -1: 0xFF x9 0x01 -> valid, stored as 0xFFFFFFFF.
+        let m = dsub(
+            &["2434", &hex],
+            &[&[1], &[]],
+            &[
+                0x08, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01,
+            ],
+            100,
+        )
+        .unwrap();
+        assert_eq!(m.buf[12..16], 0xFFFF_FFFFu32.to_le_bytes());
+        assert!(m.unknown.is_empty());
+        // Wire -2: 0xFE 0xFF x8 0x01 -> invalid (0xFFFFFFFE not in the
+        // table); the raw span becomes an unknown field.
+        let m = dsub(
+            &["2434", &hex],
+            &[&[1], &[]],
+            &[
+                0x08, 0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01,
+            ],
+            100,
+        )
+        .unwrap();
+        assert_eq!(m.buf[12..16], 0u32.to_le_bytes());
+        assert_eq!(
+            m.unknown,
+            [0x08, 0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01]
+        );
+    }
+
+    /// A packed closed-enum varint that terminates past the payload end
+    /// overruns the pushed limit: malformed (the next `IsDone` errors
+    /// upstream; casefile dsm-000235 / corpus `cep-trunc-varint` preserves
+    /// the oracle classification).
+    #[test]
+    fn closed_enum_packed_overrun_malformed() {
+        let e = dsub(&["2448", "2128"], &[&[1], &[]], &[0x0A, 0x01, 0x85], 100);
+        assert!(matches!(e, Err(KnownDecodeError::Malformed)));
+    }
+
+    /// A map-value enum that omits 0 fails the SetSubEnum map-entry rule
+    /// (link.c:110-119) — the schema is refused on both sides (oracle
+    /// link_failed; corpus `cem-nozero-link-fails`).
+    #[test]
+    fn closed_enum_map_value_nozero_rejected() {
+        // Entry %)! -> UInt32 key + ClosedEnum val; E { 1, 2 } = !( lacks 0.
+        let e = dsub(
+            &["2433", "252934", "2128"],
+            &[&[1], &[2], &[]],
+            &[0x0A, 0x00],
+            100,
+        );
+        assert!(matches!(e, Err(KnownDecodeError::Unsupported(_))));
     }
 }

@@ -122,6 +122,61 @@ pub fn messageset_descriptor() -> Vec<u8> {
     vec![b'&']
 }
 
+/// Builds a `!`-versioned enum mini descriptor from a strictly ascending
+/// list of values. Mirrors `upb_MtDataEncoder_StartEnum` /
+/// `upb_MtDataEncoder_PutEnumValue` / `upb_MtDataEncoder_EndEnum`
+/// (mini_descriptor/internal/encode.c:276-322): a 5-bit dense mask is
+/// accumulated and flushed as a base92 char; gaps >= 5 flush the mask and/or
+/// emit a skip varint (`_`..`~`). The decode side is
+/// `upb_MtDecoder_DoBuildMiniTableEnum` (mini_descriptor/build_enum.c:76-135).
+pub struct EnumEncoder {
+    out: Vec<u8>,
+    present_values_mask: u32,
+    last_written_value: u32,
+}
+
+impl EnumEncoder {
+    pub fn new() -> EnumEncoder {
+        EnumEncoder {
+            out: vec![b'!'],
+            present_values_mask: 0,
+            last_written_value: 0,
+        }
+    }
+
+    /// Adds an enum value; must be >= every previously added value.
+    pub fn value(&mut self, val: u32) {
+        let mut delta = val - self.last_written_value;
+        if delta >= 5 && self.present_values_mask != 0 {
+            self.flush_mask();
+            delta -= 5;
+        }
+        if delta >= 5 {
+            base92::encode_varint(&mut self.out, delta, CHAR_MIN_SKIP, CHAR_MAX_SKIP);
+            // Wraps like the C `uint32_t` state (encode.c:310).
+            self.last_written_value = self.last_written_value.wrapping_add(delta);
+            delta = 0;
+        }
+        debug_assert_eq!(self.present_values_mask >> delta, 0);
+        self.present_values_mask |= 1u32 << delta;
+    }
+
+    fn flush_mask(&mut self) {
+        self.out
+            .push(base92::to_base92(self.present_values_mask as i8));
+        self.present_values_mask = 0;
+        // Wraps like the C `uint32_t` state (encode.c:289).
+        self.last_written_value = self.last_written_value.wrapping_add(5);
+    }
+
+    pub fn finish(mut self) -> Vec<u8> {
+        if self.present_values_mask != 0 {
+            self.flush_mask();
+        }
+        self.out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +240,105 @@ mod tests {
         assert!(mt.fields[0].is_in_oneof());
         assert!(mt.fields[1].is_in_oneof());
         assert_eq!(mt.fields[0].presence, mt.fields[1].presence); // same oneof
+    }
+
+    /// Enum { 1, 2 } = `!(`: mask 0b110 = base92 6 = '('.
+    #[test]
+    fn enum_dense_mask() {
+        let mut e = EnumEncoder::new();
+        e.value(1);
+        e.value(2);
+        let desc = e.finish();
+        assert_eq!(desc, b"!(");
+        let mt = upb_rs_mini_table::decode::build_mini_table_enum(&desc).unwrap();
+        assert!(mt.check_value(1));
+        assert!(mt.check_value(2));
+        assert!(!mt.check_value(0));
+        assert!(!mt.check_value(3));
+    }
+
+    /// Enum { 0, 1, 2 } = `!)` (mask 0b111 = base92 7).
+    #[test]
+    fn enum_includes_zero() {
+        let mut e = EnumEncoder::new();
+        e.value(0);
+        e.value(1);
+        e.value(2);
+        let desc = e.finish();
+        assert_eq!(desc, b"!)");
+        let mt = upb_rs_mini_table::decode::build_mini_table_enum(&desc).unwrap();
+        assert!(mt.check_value(0));
+        assert!(mt.check_value(2));
+        assert!(!mt.check_value(3));
+    }
+
+    /// Enum { 64 } forces the mask region past word 1 (mask_limit 96).
+    #[test]
+    fn enum_value_beyond_64() {
+        let mut e = EnumEncoder::new();
+        e.value(64);
+        let desc = e.finish();
+        let mt = upb_rs_mini_table::decode::build_mini_table_enum(&desc).unwrap();
+        assert_eq!(mt.mask_limit, 96);
+        assert!(mt.check_value(64));
+        assert!(!mt.check_value(63));
+        assert!(!mt.check_value(65));
+    }
+
+    /// Enum { 1000 } lands in the sparse tail (value > 512).
+    #[test]
+    fn enum_sparse_tail() {
+        let mut e = EnumEncoder::new();
+        e.value(1000);
+        let desc = e.finish();
+        let mt = upb_rs_mini_table::decode::build_mini_table_enum(&desc).unwrap();
+        assert_eq!(mt.value_count, 1);
+        assert!(mt.check_value(1000));
+        assert!(!mt.check_value(999));
+        assert!(!mt.check_value(1001));
+    }
+
+    /// Enum { 0xFFFFFFFF } (a negative closed-enum value): the u32 value is
+    /// encoded via skip varints and stored in the sparse tail.
+    #[test]
+    fn enum_negative_value() {
+        let mut e = EnumEncoder::new();
+        e.value(0xFFFF_FFFF);
+        let desc = e.finish();
+        let mt = upb_rs_mini_table::decode::build_mini_table_enum(&desc).unwrap();
+        assert!(mt.check_value(0xFFFF_FFFF));
+        assert!(!mt.check_value(0xFFFF_FFFE));
+        // -1 on the wire truncates to 0xFFFFFFFF and checks valid.
+        assert!(mt.check_value(0xFFFF_FFFF));
+    }
+
+    /// Mixed dense + skip: { 1, 2, 100, 101 } flushes the first mask, skips to
+    /// 100, and emits a second mask.
+    #[test]
+    fn enum_dense_then_skip() {
+        let mut e = EnumEncoder::new();
+        e.value(1);
+        e.value(2);
+        e.value(100);
+        e.value(101);
+        let desc = e.finish();
+        let mt = upb_rs_mini_table::decode::build_mini_table_enum(&desc).unwrap();
+        assert!(mt.check_value(1));
+        assert!(mt.check_value(2));
+        assert!(mt.check_value(100));
+        assert!(mt.check_value(101));
+        assert!(!mt.check_value(99));
+        assert!(!mt.check_value(102));
+    }
+
+    /// Empty enum: no values, everything rejected.
+    #[test]
+    fn enum_empty() {
+        let e = EnumEncoder::new();
+        let desc = e.finish();
+        assert_eq!(desc, b"!");
+        let mt = upb_rs_mini_table::decode::build_mini_table_enum(&desc).unwrap();
+        assert!(!mt.check_value(0));
+        assert!(!mt.check_value(1));
     }
 }

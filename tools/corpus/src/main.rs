@@ -1259,6 +1259,14 @@ fn gen_decode_submsg_corpus(set: &mut CaseSet) {
         }
         e.finish()
     }
+    /// A `!`-versioned closed-enum descriptor for an ascending value list.
+    fn enum_descriptor(values: &[u32]) -> Vec<u8> {
+        let mut e = EnumEncoder::new();
+        for &v in values {
+            e.value(v);
+        }
+        e.finish()
+    }
     fn push_truncations(
         set: &mut CaseSet,
         mds: &[Vec<u8>],
@@ -1979,6 +1987,313 @@ fn gen_decode_submsg_corpus(set: &mut CaseSet) {
         set.push_submsg(&mds, &links, &[0x0B, 0x14], "gpo-wrong-end-group");
         set.push_submsg(&mds, &links, &[0x0C], "gpo-endgroup-top");
     }
+    // Closed enums (`!`-versioned enum tables; encoded field type 18 =
+    // ClosedEnum, 38 = repeated closed enum). Valid values are stored like
+    // Int32 (low 32 bits of the varint); invalid values become unknown fields
+    // — the raw wire span is preserved for scalar/unpacked occurrences
+    // (`_upb_Decoder_DecodeWireValue`, decode.c:889-901), while packed
+    // invalid elements are re-encoded as [varint tag][minimal varint]
+    // (`_upb_Decoder_DecodeEnumPacked`, decode.c:315-347, via
+    // AddEnumValueToUnknown).
+    {
+        // E { 1, 2 }; A { E e = 1; } (type 18, scalar).
+        let mds = vec![md_fields(&[(1, 18)]), enum_descriptor(&[1, 2])];
+        let links = vec![vec![1], vec![]];
+        set.push_submsg(&mds, &links, &[], "ce-empty");
+        set.push_submsg(&mds, &links, &[0x08, 0x01], "ce-valid-1");
+        set.push_submsg(&mds, &links, &[0x08, 0x02], "ce-valid-2");
+        set.push_submsg(&mds, &links, &[0x08, 0x00], "ce-invalid-0");
+        set.push_submsg(&mds, &links, &[0x08, 0x05], "ce-invalid-5");
+        set.push_submsg(&mds, &links, &[0x08, 0x85, 0x00], "ce-invalid-overlong-5");
+        set.push_submsg(&mds, &links, &[0x08, 0x81, 0x00], "ce-valid-overlong-1");
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x08, 0x01, 0x08, 0x05],
+            "ce-valid-then-invalid",
+        );
+        set.push_submsg(&mds, &links, &[0x08, 0x01, 0x08, 0x02], "ce-two-valid");
+        // Wire-type mismatches: the field decodes as an unknown field.
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0D, 0x01, 0x00, 0x00, 0x00],
+            "ce-wrong-wire-32",
+        );
+        set.push_submsg(&mds, &links, &[0x0A, 0x01, 0x01], "ce-wrong-wire-delimited");
+        // An enum that includes 0: wire 0 is valid.
+        let mds0 = vec![md_fields(&[(1, 18)]), enum_descriptor(&[0, 1])];
+        set.push_submsg(&mds0, &links, &[0x08, 0x00], "ce0-valid-0");
+        set.push_submsg(&mds0, &links, &[0x08, 0x02], "ce0-invalid-2");
+        // Truncations of a two-field payload.
+        let full = [0x08, 0x01, 0x08, 0x05];
+        push_truncations(set, &mds, &links, &full, "ce-two");
+    }
+    // Enum with a value at/above the 64-bit mask boundary.
+    {
+        // E { 63, 64, 65 }: 63 is the top of the first mask word; 64/65
+        // extend mask_limit to 96.
+        let mds = vec![md_fields(&[(1, 18)]), enum_descriptor(&[63, 64, 65])];
+        let links = vec![vec![1], vec![]];
+        set.push_submsg(&mds, &links, &[0x08, 0x3F], "c64-valid-63");
+        set.push_submsg(&mds, &links, &[0x08, 0x40], "c64-valid-64");
+        set.push_submsg(&mds, &links, &[0x08, 0x41], "c64-valid-65");
+        set.push_submsg(&mds, &links, &[0x08, 0x3E], "c64-invalid-62");
+        set.push_submsg(&mds, &links, &[0x08, 0x42], "c64-invalid-66");
+        set.push_submsg(&mds, &links, &[0x08, 0x80, 0x00], "c64-invalid-overlong-0");
+    }
+    // Sparse tail values (beyond mask_limit).
+    {
+        // E { 1000 } lands in the sparse tail (value > 512).
+        let mds = vec![md_fields(&[(1, 18)]), enum_descriptor(&[1000])];
+        let links = vec![vec![1], vec![]];
+        set.push_submsg(&mds, &links, &[0x08, 0xE8, 0x07], "csp-valid-1000");
+        set.push_submsg(&mds, &links, &[0x08, 0xE7, 0x07], "csp-invalid-999");
+        set.push_submsg(&mds, &links, &[0x08, 0xE9, 0x07], "csp-invalid-1001");
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x08, 0xE8, 0x07, 0x08, 0xE7, 0x07],
+            "csp-valid-then-invalid",
+        );
+    }
+    // Negative enum values: the wire carries 10-byte sign-extended varints;
+    // CheckValue truncates the u64 to u32 (`upb_MiniTableEnum_CheckValue`
+    // takes uint32_t, enum.h:26-27), so -1 matches a table holding
+    // 0xFFFFFFFF.
+    {
+        let mds = vec![md_fields(&[(1, 18)]), enum_descriptor(&[0xFFFF_FFFF])];
+        let links = vec![vec![1], vec![]];
+        set.push_submsg(
+            &mds,
+            &links,
+            &[
+                0x08, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01,
+            ],
+            "cneg-valid--1",
+        );
+        set.push_submsg(
+            &mds,
+            &links,
+            &[
+                0x08, 0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01,
+            ],
+            "cneg-invalid--2",
+        );
+        // Overlong encoding of the invalid -2 value: raw span preserved.
+        set.push_submsg(
+            &mds,
+            &links,
+            &[
+                0x08, 0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01,
+            ],
+            "cneg-invalid--2-overlong",
+        );
+    }
+    // Repeated closed enums (encoded type 38), unpacked elements.
+    {
+        let mds = vec![
+            md_fields(&[(1, 18 + REPEATED_BASE)]),
+            enum_descriptor(&[1, 2]),
+        ];
+        let links = vec![vec![1], vec![]];
+        set.push_submsg(&mds, &links, &[], "cer-empty");
+        set.push_submsg(&mds, &links, &[0x08, 0x01], "cer-one-valid");
+        set.push_submsg(&mds, &links, &[0x08, 0x05], "cer-one-invalid");
+        set.push_submsg(&mds, &links, &[0x08, 0x01, 0x08, 0x05], "cer-mixed");
+        set.push_submsg(&mds, &links, &[0x08, 0x01, 0x08, 0x02], "cer-two-valid");
+        set.push_submsg(&mds, &links, &[0x08, 0x85, 0x00], "cer-overlong-invalid");
+        set.push_submsg(&mds, &links, &[0x08, 0x81, 0x00], "cer-overlong-valid");
+        set.push_submsg(
+            &mds,
+            &links,
+            &[
+                0x08, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01,
+            ],
+            "cer-neg-1-invalid",
+        );
+        let full = [0x08, 0x01, 0x08, 0x05];
+        push_truncations(set, &mds, &links, &full, "cer-mixed");
+    }
+    // Repeated closed enums, packed.
+    {
+        let mds = vec![
+            md_fields(&[(1, 18 + REPEATED_BASE)]),
+            enum_descriptor(&[1, 2]),
+        ];
+        let links = vec![vec![1], vec![]];
+        set.push_submsg(&mds, &links, &[0x0A, 0x00], "cep-empty");
+        set.push_submsg(&mds, &links, &[0x0A, 0x01, 0x01], "cep-one-valid");
+        set.push_submsg(&mds, &links, &[0x0A, 0x01, 0x05], "cep-one-invalid");
+        set.push_submsg(&mds, &links, &[0x0A, 0x02, 0x01, 0x05], "cep-mixed");
+        set.push_submsg(&mds, &links, &[0x0A, 0x02, 0x01, 0x02], "cep-two-valid");
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x02, 0x85, 0x00],
+            "cep-overlong-invalid",
+        );
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x02, 0x81, 0x00],
+            "cep-overlong-valid",
+        );
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x03, 0x05, 0x06, 0x07],
+            "cep-all-invalid",
+        );
+        set.push_submsg(&mds, &links, &[0x0A, 0x03, 0x01, 0x05, 0x02], "cep-mixed-3");
+        // Packed payload with a varint that terminates past the declared
+        // size (zero-padding in the patch window) — both sides parse the
+        // padding value.
+        set.push_submsg(&mds, &links, &[0x0A, 0x01, 0x85], "cep-trunc-varint");
+        set.push_submsg(&mds, &links, &[0x0A, 0x81, 0x80, 0x00], "cep-overlong-size");
+        set.push_submsg(&mds, &links, &[0x0A, 0x05, 0x01], "cep-size-overrun");
+        let full = [0x0A, 0x02, 0x01, 0x05];
+        push_truncations(set, &mds, &links, &full, "cep-mixed");
+    }
+    // Packed negative enum values.
+    {
+        let mds = vec![
+            md_fields(&[(1, 18 + REPEATED_BASE)]),
+            enum_descriptor(&[0xFFFF_FFFF]),
+        ];
+        let links = vec![vec![1], vec![]];
+        let neg1 = [
+            0x0A, 0x0A, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01,
+        ];
+        set.push_submsg(&mds, &links, &neg1, "cpneg-valid--1");
+        set.push_submsg(
+            &mds,
+            &links,
+            &[
+                0x0A, 0x14, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0xFE, 0xFF,
+                0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01,
+            ],
+            "cpneg-valid-then-invalid",
+        );
+    }
+    // Closed enum in a oneof.
+    {
+        // A { oneof { E e = 1; uint32 x = 2; } }.
+        let mds = vec![md_oneof(&[(1, 18), (2, 7)]), enum_descriptor(&[1, 2])];
+        let links = vec![vec![1], vec![]];
+        set.push_submsg(&mds, &links, &[0x08, 0x01], "ceo-valid");
+        set.push_submsg(&mds, &links, &[0x08, 0x05], "ceo-invalid");
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x10, 0x07, 0x08, 0x01],
+            "ceo-scalar-then-enum",
+        );
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x08, 0x01, 0x10, 0x07],
+            "ceo-enum-then-scalar",
+        );
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x08, 0x05, 0x08, 0x01],
+            "ceo-invalid-then-valid",
+        );
+    }
+    // Closed enum as a map VALUE. The entry's val field links via SetSubEnum,
+    // which requires the enum to include 0 (link.c:110-119); protoc
+    // guarantees it, and the oracle reports link_failed when it is missing.
+    {
+        // A { map<uint32, E> m = 1; } with E { 0, 1, 2 }.
+        let mds = vec![
+            md_fields(&[(1, 17)]),
+            map_descriptor(7, 18),
+            enum_descriptor(&[0, 1, 2]),
+        ];
+        let links = vec![vec![1], vec![2], vec![]];
+        set.push_submsg(&mds, &links, &[], "cem-empty");
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x04, 0x08, 0x05, 0x10, 0x01],
+            "cem-valid",
+        );
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x04, 0x08, 0x05, 0x10, 0x02],
+            "cem-valid-2",
+        );
+        // Invalid value: the entry carries an unknown and is re-encoded under
+        // the map field's tag (AddMapEntryUnknown).
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x04, 0x08, 0x05, 0x10, 0x07],
+            "cem-invalid",
+        );
+        // Absent value: defaults to 0, which is valid for this enum.
+        set.push_submsg(&mds, &links, &[0x0A, 0x02, 0x08, 0x05], "cem-val-absent");
+        // A second entry with a valid value after an invalid one.
+        set.push_submsg(
+            &mds,
+            &links,
+            &[
+                0x0A, 0x04, 0x08, 0x05, 0x10, 0x07, 0x0A, 0x04, 0x08, 0x02, 0x10, 0x01,
+            ],
+            "cem-invalid-then-valid",
+        );
+        // Map-value enum WITHOUT 0: the link fails on both sides (oracle
+        // link_failed; DUT refuses the schema).
+        let mds_nozero = vec![
+            md_fields(&[(1, 17)]),
+            map_descriptor(7, 18),
+            enum_descriptor(&[1, 2]),
+        ];
+        let links_nozero = vec![vec![1], vec![2], vec![]];
+        set.push_submsg(
+            &mds_nozero,
+            &links_nozero,
+            &[0x0A, 0x00],
+            "cem-nozero-link-fails",
+        );
+    }
+    // Closed enum as a repeated map VALUE.
+    {
+        // A { map<uint32, E> m = 1; } with repeated closed enum values
+        // (entry val field type 38): valid elements store, invalid packed
+        // elements re-encode as entry unknowns.
+        let mds = vec![
+            md_fields(&[(1, 17)]),
+            map_descriptor(7, 18 + REPEATED_BASE),
+            enum_descriptor(&[0, 1, 2]),
+        ];
+        let links = vec![vec![1], vec![2], vec![]];
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x05, 0x08, 0x05, 0x12, 0x01, 0x01],
+            "cemr-valid",
+        );
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x05, 0x08, 0x05, 0x12, 0x01, 0x05],
+            "cemr-invalid",
+        );
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x06, 0x08, 0x05, 0x12, 0x02, 0x01, 0x05],
+            "cemr-mixed",
+        );
+    }
+    // Unlinked closed enum: NOT generated — upstream dereferences a NULL sub
+    // table during decode (UB; §49). The DUT refuses such schemas
+    // (reject_deferred); covered by the DUT unit test
+    // `closed_enum_unlinked_rejected`.
 }
 
 fn main() {

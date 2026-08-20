@@ -9,7 +9,7 @@ courts against a pinned upstream oracle.
 This is **not** a wrapper, a binding, a `bindgen` façade, or another
 independent protobuf library. It is a compatibility implementation whose
 behavioral oracle is the pinned upstream protobuf source tree in
-`third_party/protobuf` (see `third_party/protobuf/PIN.md`).
+`third_party/protobuf` (see `third_party/PIN.md`).
 
 ## Non-negotiable ground rules (§1, §6, §42, §47 of the charter)
 

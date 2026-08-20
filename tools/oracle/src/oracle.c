@@ -939,6 +939,8 @@ static void run_decode_submsg(int64_t id, const char* hex, int64_t depth,
   upb_Status_Clear(&status);
 
   upb_MiniTable* tables[MAX_TABLES] = {0};
+  upb_MiniTableEnum* enum_tables[MAX_TABLES] = {0};
+  int is_enum[MAX_TABLES] = {0};
   for (int t = 0; t < n_mds; t++) {
     uint8_t desc[MAX_INPUT_BYTES];
     int dn = parse_hex(mds[t], strlen(mds[t]), desc, sizeof(desc));
@@ -949,16 +951,33 @@ static void run_decode_submsg(int64_t id, const char* hex, int64_t depth,
       upb_Arena_Free(arena);
       return;
     }
-    tables[t] =
-        upb_MiniTable_Build((const char*)desc, (size_t)dn, arena, &status);
-    if (!tables[t]) {
-      emit_header(id, "error");
-      emit_field_str("code", "minitable_build_failed");
-      printf(",\"msg\":");
-      emit_json_string_raw(status.msg);
-      emit_end();
-      upb_Arena_Free(arena);
-      return;
+    // kUpb_EncodedVersion_EnumV1 = '!' (wire_constants.h:63; not exported
+    // by the headers oracle.c includes — def.inc undefines it).
+    if (dn > 0 && desc[0] == '!') {
+      enum_tables[t] =
+          upb_MiniTableEnum_Build((const char*)desc, (size_t)dn, arena, &status);
+      if (!enum_tables[t]) {
+        emit_header(id, "error");
+        emit_field_str("code", "enum_build_failed");
+        printf(",\"msg\":");
+        emit_json_string_raw(status.msg);
+        emit_end();
+        upb_Arena_Free(arena);
+        return;
+      }
+      is_enum[t] = 1;
+    } else {
+      tables[t] =
+          upb_MiniTable_Build((const char*)desc, (size_t)dn, arena, &status);
+      if (!tables[t]) {
+        emit_header(id, "error");
+        emit_field_str("code", "minitable_build_failed");
+        printf(",\"msg\":");
+        emit_json_string_raw(status.msg);
+        emit_end();
+        upb_Arena_Free(arena);
+        return;
+      }
     }
   }
 
@@ -968,6 +987,7 @@ static void run_decode_submsg(int64_t id, const char* hex, int64_t depth,
   // be treated as an unknown field during parsing"); once the provided links
   // are exhausted, all remaining sub fields are unlinked.
   for (int t = 0; t < n_mds; t++) {
+    if (is_enum[t]) continue;  // enum tables carry no sub fields
     int slot = 0;
     int fc = upb_MiniTable_FieldCount(tables[t]);
     for (int i = 0; i < fc; i++) {
@@ -985,7 +1005,15 @@ static void run_decode_submsg(int64_t id, const char* hex, int64_t depth,
         upb_Arena_Free(arena);
         return;
       }
-      if (!upb_MiniTable_SetSubMessage(tables[t], f, tables[target])) {
+      // Enum fields link with SetSubEnum (the target is an enum table); all
+      // other sub fields (message/group) with SetSubMessage. A kind mismatch
+      // makes the setter return false.
+      bool linked = is_enum[target]
+                        ? upb_MiniTable_SetSubEnum(tables[t], f,
+                                                   enum_tables[target])
+                        : upb_MiniTable_SetSubMessage(tables[t], f,
+                                                      tables[target]);
+      if (!linked) {
         emit_header(id, "error");
         emit_field_str("code", "link_failed");
         emit_end();

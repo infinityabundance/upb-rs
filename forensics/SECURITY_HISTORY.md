@@ -1,7 +1,7 @@
 # SECURITY_HISTORY.md — upb security archaeology
 
 Oracle pin: `2de70d710510ea7c5ad7ec0c72bfed7f411c7b60` (37-dev, 2026-08-19),
-see `third_party/protobuf/PIN.md`. All commit SHAs below are full SHAs as
+see `third_party/PIN.md`. All commit SHAs below are full SHAs as
 resolved by `git log` in `third_party/protobuf`; file:line citations are
 against the pinned working tree. Method notes: `git log --grep` was run
 case-insensitively over commit subjects, scoped to `-- upb/` unless stated;

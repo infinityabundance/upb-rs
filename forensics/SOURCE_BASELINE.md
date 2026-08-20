@@ -13,7 +13,7 @@ atlases (OPEN_QUESTIONS.md §5.3).
 
 | Field | Value | Evidence |
 |---|---|---|
-| Repository | `https://github.com/protocolbuffers/protobuf.git` | `third_party/protobuf/PIN.md:11` |
+| Repository | `https://github.com/protocolbuffers/protobuf.git` | `third_party/PIN.md:11` |
 | Commit SHA | `2de70d710510ea7c5ad7ec0c72bfed7f411c7b60` | `PIN.md:12`; `git rev-parse HEAD` |
 | describe | `v36-dev-400-g2de70d710` | `git describe --tags` |
 | version.json | `protoc 37-dev`, `rust 0.37-dev`; `date: 2026-07-09`; `lts: false`; cpp 7.37-dev, python 7.37-dev, legacy_rust 4.37-dev | `third_party/protobuf/version.json:2-17` (main.protoc_version :3, main.languages.rust :15) |

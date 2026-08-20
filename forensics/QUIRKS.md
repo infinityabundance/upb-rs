@@ -358,3 +358,44 @@ history before the protobuf repo merge is squashed; see NONDETERMINISM.md §1.3)
 - **Groups in oneofs/unlinked messages** degrade to unknown-field ops
   (`_upb_Decoder_CheckUnlinked`, decode.c:791-800; `_VerifyOneofUnlinked`,
   decoder.h:204-218).
+
+## 16. Closed-enum specifics (sealed in decode-submsg-v1, 259/259)
+
+- **Invalid scalar/unpacked closed-enum values keep the raw wire span**: the
+  value is captured byte-for-byte as an unknown field, so overlong encodings
+  round-trip unchanged (decode.c:889-901 + `_upb_DecodeUnknowns`,
+  decode.c:1010-1081). Packed invalid values instead get *re-encoded* as
+  `[minimal varint tag][minimal varint]` via
+  `_upb_Encoder_AddEnumValueToUnknown` (decode.c:315-347) — an overlong
+  `85 00` in a packed payload round-trips as `08 05`, not `08 85 00`. This
+  asymmetry (raw for unpacked, minimal for packed) is oracle-verified.
+- **CheckValue truncates the wire varint to u32** (`upb_MiniTableEnum_CheckValue`
+  takes `uint32_t`, mini_table/internal/enum.h:26-27): a 10-byte
+  sign-extended `-1` on the wire matches a table holding `0xFFFFFFFF`, and
+  the stored value is the low 32 bits (MungeInt32 semantics).
+- **Enum descriptor arithmetic wraps** like C `uint32_t`: `base += skip` and
+  `base++` in build_enum.c:105,114 and `last_written_value += delta` in
+  encode.c:289,310 are wrapping, and an out-of-alphabet mask char
+  (`_upb_FromBase92` returning -1) becomes an all-ones mask (all 5 values
+  added) rather than an error.
+- **Map-value enums must include 0**: `upb_MiniTable_SetSubEnum` returns
+  false for a map entry whose enum lacks 0 (link.c:110-119, "Enum value in
+  map must define 0 as the first value" — protoc guarantees it). The oracle
+  reports `link_failed`; the DUT refuses the schema (classified together in
+  the court as a build/link failure, exact oracle code preserved in
+  residuals).
+- **Unlinked closed enums are NOT courtable**: decoding through a NULL sub
+  table is UB upstream (dereference in `upb_MiniTable_GetSubEnumTable`); the
+  DUT refuses such schemas defensively (§49), covered by a DUT unit test
+  (`closed_enum_unlinked_rejected`) — deliberately not in the differential
+  corpus.
+- **Packed varints overrunning the payload limit are malformed**: a packed
+  element whose varint terminates past the declared size pushes the stream
+  position past the limit, and the next `IsDone` raises an error
+  (decode.c:298). Corpus case `cep-trunc-varint` (payload `0A 01 85`)
+  caught the DUT's missing classification.
+- **Build/link failure classification**: the oracle's
+  `minitable_build_failed` / `enum_build_failed` / `link_failed` / `oom`
+  codes and the DUT's `Unsupported` refusal are the same observable class
+  (schema rejected before decoding) and are compared as such in the court;
+  the exact oracle code is retained in residual records for audit.

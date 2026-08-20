@@ -184,7 +184,7 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
 name = "upb-rs"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "upb-rs-casefile",
  "upb-rs-core",
@@ -211,7 +211,7 @@ dependencies = [
 
 [[package]]
 name = "upb-rs-mini-table"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -228,7 +228,7 @@ dependencies = [
 
 [[package]]
 name = "upb-rs-wire"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "serde",
  "serde_json",

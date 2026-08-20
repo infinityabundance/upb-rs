@@ -1,6 +1,6 @@
 [package]
 name = "upb-rs-wire"
-version = "0.1.4"
+version = "0.1.5"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -10,6 +10,6 @@ description = "Wire-format reader/encoder for upb-rs, mirroring upb/wire/reader.
 
 [dependencies]
 upb-rs-core = { version = "0.1.0", path = "../upb-rs-core" }
-upb-rs-mini-table = { version = "0.1.0", path = "../upb-rs-mini-table" }
+upb-rs-mini-table = { version = "0.1.1", path = "../upb-rs-mini-table" }
 serde = { workspace = true }
 serde_json = { workspace = true }

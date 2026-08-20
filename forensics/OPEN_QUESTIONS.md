@@ -18,11 +18,11 @@ located. See Risks §5.
 **Phase 0 (archaeology + court infrastructure)** is complete: the forensic
 atlas set, pinned oracle, oracle protocol, casefile format, differential
 protocol, and the first courts are live (see STATUS.md). **Phase 1 (core
-representation + arena)** is now PARITY-SEALED: the ArenaPool, Array, and
-Map models are court-verified against the real upb_Arena / upb_Array /
-upb_Map (courts/arena 61/61, courts/collections 52/52, 0 residuals), and
-message storage / field presence / oneofs / unknown storage are sealed
-through the decode-known (517) and decode-submsg (93) courts. The message
+representation + arena)** is PARITY-SEALED: the ArenaPool, Array, and Map
+models are court-verified against the real upb_Arena / upb_Array / upb_Map
+(courts/arena 61/61, courts/collections 52/52, 0 residuals), and message
+storage / field presence / oneofs / unknown storage are sealed through the
+decode-known (517) and decode-submsg (259) courts. The message
 representation remains Vec-based (semantic parity; representation free per
 charter §8); arena-backed message storage is deferred to Phase 2, where
 map decode (`_upb_Decoder_DecodeToMap`) requires arena-backed maps/arrays
@@ -34,7 +34,7 @@ Phase sequence (charter §43, now authoritative):
 |---|---|---|
 | 0 | Archaeology + court infrastructure | DONE |
 | 1 | Core representation and arena (arena, strings/bytes, arrays, maps, message storage, presence, oneofs, unknown storage, core mini-table structures) | **PARITY-SEALED** |
-| 2 | Binary wire parity (decoder: maps/groups/closed enums; encoder; merge/clear/clone; unknown handling; deterministic mode) | **NEXT** |
+| 2 | Binary wire parity (decoder: maps/groups/closed enums; encoder; merge/clear/clone; unknown handling; deterministic mode) | **NEXT** (decoder sub-items sealed; encoder court next) |
 | 3 | Mini descriptors and generated metadata (schema-synthesis courts at scale) | pending |
 | 4 | Reflection, descriptors, extensions | pending |
 | 5 | JSON, text, well-known types | pending |
@@ -155,11 +155,16 @@ Phase sequence (charter §43, now authoritative):
    `_upb_Decoder_GetAddUnknownMode`, `decode.c:118-130`) needs oracle
    pinning via `upb_Message_NextUnknown2` + address equality, which the
    oracle protocol must expose.
-8. **[OPEN] Packed-enum unknown ordering.** `_upb_Decoder_AddEnumValueToUnknown`
-   (`decode.c:276-296`, `field_varint.c:40-60`) re-encodes tag+value;
-   where do these synthesized unknowns land relative to pre-existing
-   unknown regions? How: oracle decode of packed closed-enum with
-   out-of-range values interleaved with unknowns; byte-compare re-encode.
+8. **[RESOLVED 2026-08-20] Packed-enum unknown ordering.**
+   `_upb_Decoder_AddEnumValueToUnknown` (decode.c:315-347) appends each
+   re-encoded [minimal tag][minimal varint] to the message unknowns **in
+   decode order**, interleaved after any pre-existing unknown regions
+   (the unknowns buffer is appended in wire order). Verified by the
+   closed-enum corpus (`cep-*` cases: 0805, 0805 0806 0807 in decode
+   order) in the decode-submsg court, 259/259 sealed. Residual: the
+   exact ordering relative to *pre-existing* unknown regions was not
+   re-courted separately (the corpus interleaves only via map-entry
+   re-encodes); see item 8 in §3 for the merge/encode ordering question.
 9. **[OPEN] Deterministic map ordering tie-break.** `_upb_mapsorter`
    (`encoder.c:594-640,857`) sorts; the exact comparison key for
    equal-first-bytes string keys (secondary sort) is implementation detail
@@ -182,10 +187,10 @@ Phase sequence (charter §43, now authoritative):
 
 ## 4. Continuous upstream tracking procedure (charter §50)
 
-Workflow (mirrors `third_party/protobuf/PIN.md:27-36`; §50 referenced,
+Workflow (mirrors `third_party/PIN.md:27-36`; §50 referenced,
 charter text absent `[INFERRED]`):
 
-1. **Record** old/new SHAs in `third_party/protobuf/PIN.md` (also update
+1. **Record** old/new SHAs in `third_party/PIN.md` (also update
    `PARITY.toml [meta] upstream` and `updated`).
 2. **Fetch new upstream**: `git -C third_party/protobuf fetch origin`, hard
    move to the new SHA (partial clone fetches blobs on demand).

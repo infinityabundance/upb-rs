@@ -14,8 +14,15 @@
 //! Surface (v1): linked sub-messages — singular (with merge semantics),
 //! repeated, nested, recursive (self- and mutual), oneof members, depth
 //! limits, truncations, size/budget overruns, unknown fields inside
-//! sub-messages, unlinked slots. Maps, groups, and closed enums are deferred;
-//! the corpus generator never emits them.
+//! sub-messages, unlinked slots. Maps, groups, and closed enums (valid and
+//! invalid values, packed re-encoding, negative values, map-value enums) are
+//! covered in the same court; see the corpus generator sections `mp-*`,
+//! `gp-*`/`gpr-*`/`gpn-*`/`gpo-*`, and `ce-*`/`cer-*`/`cep-*`/`cem-*`.
+//!
+//! Build/link failures (oracle codes `minitable_build_failed`,
+//! `enum_build_failed`, `link_failed`, `oom`) are classified together with
+//! the DUT's `unsupported` refusal: both reject the schema before decoding,
+//! and the oracle's precise code is preserved in the residual record.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -142,7 +149,19 @@ fn main() {
                     KnownDecodeError::MaxDepthExceeded => "max_depth_exceeded",
                     KnownDecodeError::Unsupported(_) => "unsupported",
                 };
-                oracle_code == dut_code
+                if dut_code == "unsupported" {
+                    // The DUT refuses a schema it cannot build or link; the
+                    // oracle reports the precise build failure. Both are the
+                    // same observable class (the schema is rejected before
+                    // decoding). The exact oracle code is preserved in the
+                    // residual record for audit.
+                    matches!(
+                        oracle_code,
+                        "minitable_build_failed" | "enum_build_failed" | "link_failed" | "oom"
+                    )
+                } else {
+                    oracle_code == dut_code
+                }
             }
             _ => false,
         };

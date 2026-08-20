@@ -66,7 +66,14 @@ status = "parity-sealed"
 oracle = "protobuf:2de70d710510ea7c5ad7ec0c72bfed7f411c7b60"
 court = "decode-submsg-v1"
 residuals = 0
-note = "linked sub-message and map decode: singular (merge semantics), repeated, nested, recursive (self- and mutual links), oneof members (switch clears, re-set merges), depth budget 99/100/101 boundaries (MaxDepthExceeded), truncations at every offset, size/budget overruns, unknown fields inside sub-messages, unlinked slots (decode as unknown), packed-inside-sub, map fields (last-wins insert, empty entries insert zeros, string keys/values, negative/zigzag keys, message values incl. absent-value-empty-message and unknown-inside-value, nested maps, unknown-inside-entry re-encode via AddMapEntryUnknown, wrong wire types, depth boundaries for entries/values/nested maps). 142/142 cases equal. Court caught and sealed the oneof-case-word dump regression (casefile oneof-case-word-dump). Deferred: groups, closed enums."
+note = "linked sub-message, map, group, and closed-enum decode: singular (merge semantics), repeated, nested, recursive (self- and mutual links), oneof members (switch clears, re-set merges), depth budget 99/100/101 boundaries (MaxDepthExceeded), truncations at every offset, size/budget overruns, unknown fields inside sub-messages, unlinked slots (decode as unknown), packed-inside-sub, map fields (last-wins insert, empty entries insert zeros, string keys/values, negative/zigzag keys, message values incl. absent-value-empty-message and unknown-inside-value, nested maps, unknown-inside-entry re-encode via AddMapEntryUnknown, wrong wire types, depth boundaries for entries/values/nested maps), group fields (singular/merge, repeated, nested, oneof, unlinked, depth, malformed EndGroup), closed enums (valid/invalid/overlong/negative values, unpacked raw-span preservation, packed re-encode via AddEnumValueToUnknown, map-value enums incl. the SetSubEnum include-0 rule, oneofs). 259/259 cases equal. Court caught and sealed: the oneof-case-word dump regression (casefile oneof-case-word-dump), the packed closed-enum position bug, and the packed-varint-overrun classification (corpus cep-trunc-varint)."
+
+[wire.decode.closed_enum]
+status = "parity-sealed"
+oracle = "protobuf:2de70d710510ea7c5ad7ec0c72bfed7f411c7b60"
+court = "decode-submsg-v1"
+residuals = 0
+note = "MiniTableEnum build + link (SetSubEnum incl. map-entry include-0 rule) + decode: invalid scalar/unpacked values become unknown fields with the raw span preserved (overlong encodings kept); invalid packed values are re-encoded as [minimal tag][minimal varint]; valid values store as int32 (low 32 bits of the wire varint, matching CheckValue's uint32_t truncation); negative values via 10-byte sign-extended varints; sparse tails and mask expansion; packed varints overrunning the payload limit are malformed."
 
 [wire.encode]
 status = "unmapped"
@@ -83,7 +90,7 @@ status = "oracle-tested"
 oracle = "protobuf:2de70d710510ea7c5ad7ec0c72bfed7f411c7b60"
 court = "mini-table-inspect-v1"
 residuals = 0
-note = "base92 varints, message/map/messageset grammar, modifiers, skips, oneofs; error classification incl. control-char and NUL-truncation conventions"
+note = "base92 varints, message/map/messageset grammar, modifiers, skips, oneofs; error classification incl. control-char and NUL-truncation conventions. Closed-enum descriptors (! version) are covered by the decode-submsg court: mask chars <= 'A', skip varints, mask_limit growth, sparse tails, wrapping base arithmetic (build_enum.c), all-ones mask for out-of-alphabet chars."
 
 [arena]
 status = "parity-sealed"
