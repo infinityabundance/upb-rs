@@ -38,6 +38,8 @@ pub struct OracleRequest {
     pub tag: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub depth: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub md: Option<String>,
 }
 
 impl OracleRequest {
@@ -49,6 +51,7 @@ impl OracleRequest {
             hex: hex_encode(payload),
             tag: None,
             depth: None,
+            md: None,
         }
     }
 
@@ -60,6 +63,7 @@ impl OracleRequest {
             hex: hex_encode(payload),
             tag: Some(tag as u64),
             depth: None,
+            md: None,
         }
     }
 
@@ -71,6 +75,7 @@ impl OracleRequest {
             hex: hex_encode(payload),
             tag: Some(tag as u64),
             depth: None,
+            md: None,
         }
     }
 
@@ -82,6 +87,19 @@ impl OracleRequest {
             hex: hex_encode(payload),
             tag: None,
             depth: Some(depth as u64),
+            md: None,
+        }
+    }
+
+    pub fn decode_known(id: u64, md: &[u8], payload: &[u8]) -> OracleRequest {
+        OracleRequest {
+            v: 1,
+            id,
+            op: "decode_known".to_string(),
+            hex: hex_encode(payload),
+            tag: None,
+            depth: None,
+            md: Some(hex_encode(md)),
         }
     }
 }
@@ -122,6 +140,9 @@ pub struct OracleResponse {
     /// mini_table_inspect error: the upstream error message.
     #[serde(default)]
     pub msg: Option<String>,
+    /// decode_known: the normalized message dump on success.
+    #[serde(default)]
+    pub dump: Option<serde_json::Value>,
 }
 
 impl OracleResponse {

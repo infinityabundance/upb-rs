@@ -1,0 +1,14 @@
+[package]
+name = "court-decode-known"
+version = "0.1.0"
+edition = "2021"
+description = "Differential court: known-field message decode (scalars, strings/bytes, repeated, oneofs), oracle (real upb_Decode) vs DUT (upb-rs-wire decode_known)"
+
+[dependencies]
+upb-rs-core = { path = "../../crates/upb-rs-core" }
+upb-rs-wire = { path = "../../crates/upb-rs-wire" }
+upb-rs-mini-table = { path = "../../crates/upb-rs-mini-table" }
+upb-rs-oracle = { path = "../../crates/upb-rs-oracle" }
+upb-rs-casefile = { path = "../../crates/upb-rs-casefile" }
+serde = { workspace = true }
+serde_json = { workspace = true }

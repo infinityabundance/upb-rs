@@ -26,6 +26,7 @@
 #include "upb/base/status.h"
 #include "upb/mem/arena.h"
 #include "upb/message/message.h"
+#include "upb/message/unknown_fields.h"
 #include "upb/mini_descriptor/decode.h"
 #include "upb/mini_table/message.h"
 #include "upb/wire/decode.h"
@@ -531,6 +532,200 @@ static void run_mini_table_inspect(int64_t id, const char* hex) {
 }
 
 // ---------------------------------------------------------------------------
+// decode_known: real upb_Decode into a message whose mini table is built from
+// a mini descriptor, then a normalized accessor dump of the decoded state
+// (court decode-known-v1). The Rust DUT must produce the identical dump.
+// ---------------------------------------------------------------------------
+
+static void emit_hex_bytes(const unsigned char* p, size_t n) {
+  for (size_t i = 0; i < n; i++) printf("%02x", p[i]);
+}
+
+static size_t field_elem_size(uint8_t type) {
+  switch (type) {
+    case 8: return 1;  // Bool
+    case 2: case 7: case 15: case 5: case 13: case 14: case 17: return 4;
+    case 1: case 6: case 16: case 3: case 4: case 18: return 8;
+    default: return 16;  // String/Bytes: upb_StringView
+  }
+}
+
+static void emit_dump(const upb_Message* msg, const upb_MiniTable* mt) {
+  int field_count = upb_MiniTable_FieldCount(mt);
+  int first_emitted = 1;
+  printf(",\"dump\":{\"fields\":[");
+  for (int i = 0; i < field_count; i++) {
+    const upb_MiniTableField* f = upb_MiniTable_GetFieldByIndex(mt, i);
+    uint32_t number = f->number_dont_copy_me__upb_internal_use_only;
+    uint8_t type = f->descriptortype_dont_copy_me__upb_internal_use_only;
+    uint16_t offset = f->offset_dont_copy_me__upb_internal_use_only;
+    int is_array = (f->mode_dont_copy_me__upb_internal_use_only & 3) == 1;
+    if (is_array) {
+      if (!first_emitted) printf(",");
+      first_emitted = 0;
+      printf("{\"number\":%u,\"value\":[", number);
+      const upb_Array* arr = *(const upb_Array**)((const char*)msg + offset);
+      if (arr) {
+        size_t n = upb_Array_Size(arr);
+        size_t esz = field_elem_size(type);
+        const char* data = (const char*)upb_Array_DataPtr(arr);
+        for (size_t j = 0; j < n; j++) {
+          if (j) printf(",");
+          printf("\"");
+          if (type == 9 || type == 12) {
+            const upb_StringView* sv = (const upb_StringView*)data + j;
+            emit_hex_bytes((const unsigned char*)sv->data, sv->size);
+          } else {
+            emit_hex_bytes((const unsigned char*)data + j * esz, esz);
+          }
+          printf("\"");
+        }
+      }
+      printf("]}");
+      continue;
+    }
+    int present;
+    if (f->presence > 0) {
+      present = (((const unsigned char*)msg)[f->presence / 8] >> (f->presence % 8)) & 1;
+    } else if (f->presence < 0) {
+      uint32_t case_offset = (uint32_t)~f->presence;
+      uint32_t c = *(const uint32_t*)((const char*)msg + case_offset);
+      present = (c == number);
+    } else {
+      present = 1;  // proto3 singular
+    }
+    if (!present) continue;
+    if (!first_emitted) printf(",");
+    first_emitted = 0;
+    printf("{\"number\":%u,\"value\":\"", number);
+    if (type == 9 || type == 12) {
+      const upb_StringView* sv =
+          (const upb_StringView*)((const char*)msg + offset);
+      emit_hex_bytes((const unsigned char*)sv->data, sv->size);
+    } else {
+      size_t n = field_elem_size(type);
+      if (n > 8) n = 8;
+      emit_hex_bytes((const unsigned char*)((const char*)msg + offset), n);
+    }
+    printf("\"}");
+  }
+  printf("],\"oneof_cases\":[");
+  // Collect and sort case offsets, then emit.
+  {
+    uint16_t offsets[64];
+    int n_offsets = 0;
+    for (int i = 0; i < field_count && n_offsets < 64; i++) {
+      const upb_MiniTableField* f = upb_MiniTable_GetFieldByIndex(mt, i);
+      if (f->presence < 0) {
+        uint16_t off = (uint16_t)~f->presence;
+        int dup = 0;
+        for (int j = 0; j < n_offsets; j++) {
+          if (offsets[j] == off) dup = 1;
+        }
+        if (!dup) offsets[n_offsets++] = off;
+      }
+    }
+    for (int a = 0; a < n_offsets; a++) {
+      for (int b = a + 1; b < n_offsets; b++) {
+        if (offsets[b] < offsets[a]) {
+          uint16_t t = offsets[a];
+          offsets[a] = offsets[b];
+          offsets[b] = t;
+        }
+      }
+    }
+    for (int a = 0; a < n_offsets; a++) {
+      if (a) printf(",");
+      uint32_t c = *(const uint32_t*)((const char*)msg + offsets[a]);
+      printf("{\"case_offset\":%u,\"case\":%u}", offsets[a], c);
+    }
+  }
+  printf("],\"unknown\":\"");
+  {
+    uintptr_t iter = 0;
+    upb_MessageUnknown u;
+    while (upb_Message_NextUnknown2(msg, &u, &iter)) {
+      if (u.type == kUpb_MessageUnknownType_StringView) {
+        emit_hex_bytes((const unsigned char*)u.value.bytes.data, u.value.bytes.size);
+      }
+    }
+  }
+  printf("\"}");
+}
+
+static void run_decode_known(int64_t id, const char* hex, const char* md,
+                             int64_t depth) {
+  uint8_t input[MAX_INPUT_BYTES];
+  uint8_t desc[MAX_INPUT_BYTES];
+  int n = parse_hex(hex, strlen(hex), input, sizeof(input));
+  int dn = parse_hex(md, strlen(md), desc, sizeof(desc));
+  if (n < 0 || dn < 0) {
+    emit_header(id, "error");
+    emit_field_str("code", "bad_hex");
+    emit_end();
+    return;
+  }
+
+  upb_Arena* arena = upb_Arena_New();
+  upb_Status status;
+  upb_Status_Clear(&status);
+  upb_MiniTable* mt =
+      upb_MiniTable_Build((const char*)desc, (size_t)dn, arena, &status);
+  if (!mt) {
+    emit_header(id, "error");
+    emit_field_str("code", "minitable_build_failed");
+    printf(",\"msg\":");
+    emit_json_string_raw(status.msg);
+    emit_end();
+    upb_Arena_Free(arena);
+    return;
+  }
+
+  upb_Message* msg = upb_Message_New(mt, arena);
+  if (!msg) {
+    emit_header(id, "error");
+    emit_field_str("code", "oom");
+    emit_end();
+    upb_Arena_Free(arena);
+    return;
+  }
+
+  int options = 0;
+  if (depth > 0 && depth <= 65535) {
+    options = (int)upb_DecodeOptions_MaxDepth((uint16_t)depth);
+  }
+  upb_DecodeStatus ds = upb_Decode((const char*)input, (size_t)n, msg, mt, NULL,
+                                   options, arena);
+  if (ds == kUpb_DecodeStatus_Ok) {
+    emit_header(id, "ok");
+    emit_dump(msg, mt);
+    emit_end();
+  } else if (ds == kUpb_DecodeStatus_Malformed) {
+    emit_header(id, "error");
+    emit_field_str("code", "malformed");
+    emit_end();
+  } else if (ds == kUpb_DecodeStatus_BadUtf8) {
+    emit_header(id, "error");
+    emit_field_str("code", "bad_utf8");
+    emit_end();
+  } else if (ds == kUpb_DecodeStatus_MaxDepthExceeded) {
+    emit_header(id, "error");
+    emit_field_str("code", "max_depth_exceeded");
+    emit_end();
+  } else if (ds == kUpb_DecodeStatus_OutOfMemory) {
+    emit_header(id, "error");
+    emit_field_str("code", "oom");
+    emit_end();
+  } else {
+    emit_header(id, "error");
+    emit_field_str("code", "other");
+    emit_field_int("code_num", (int64_t)ds);
+    emit_end();
+  }
+  upb_Arena_Free(arena);
+}
+
+// ---------------------------------------------------------------------------
 // Main loop
 // ---------------------------------------------------------------------------
 
@@ -600,6 +795,12 @@ int main(void) {
       run_decode_empty(id, hex, depth);
     } else if (strcmp(op, "mini_table_inspect") == 0) {
       run_mini_table_inspect(id, hex);
+    } else if (strcmp(op, "decode_known") == 0) {
+      char md[8192] = {0};
+      int64_t depth = 0;
+      json_string(line, "\"md\"", md, sizeof(md));
+      json_int(line, "\"depth\"", &depth);
+      run_decode_known(id, hex, md, depth);
     } else {
       emit_header(id, "error");
       emit_field_str("code", "unknown_op");

@@ -36,6 +36,8 @@ struct Case {
     tag: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     depth: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    md: Option<String>,
     kind: String,
     seed: u64,
 }
@@ -98,6 +100,19 @@ impl CaseSet {
             hex: hex(bytes),
             tag,
             depth: None,
+            md: None,
+            kind: kind.to_string(),
+            seed: self.seed,
+        });
+    }
+
+    fn push_md(&mut self, op: &str, md: &[u8], bytes: &[u8], kind: &str) {
+        self.cases.push(Case {
+            op: op.to_string(),
+            hex: hex(bytes),
+            tag: None,
+            depth: None,
+            md: Some(hex(md)),
             kind: kind.to_string(),
             seed: self.seed,
         });
@@ -109,6 +124,7 @@ impl CaseSet {
             hex: hex(bytes),
             tag: None,
             depth: Some(depth),
+            md: None,
             kind: kind.to_string(),
             seed: self.seed,
         });
@@ -324,10 +340,12 @@ fn gen_skip_value_corpus(set: &mut CaseSet) {
     set.push_truncations("skip_value", Some(0x0D), &pattern, "skipval-32bit");
     set.push_truncations("skip_value", Some(0x09), &pattern, "skipval-64bit");
     // Delimited (tag 0x0A): sizes with exact payloads.
-    for size in [0u64, 1, 2, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128, 255, 256] {
-        let payload: Vec<u8> = (0..size as usize).map(|i| (i % 251) as u8).collect();
+    for len in [
+        1usize, 2, 7, 8, 15, 16, 17, 31, 32, 63, 64, 127, 128, 255, 256,
+    ] {
+        let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
         let mut enc = Vec::new();
-        encode_varint(size, &mut enc);
+        encode_varint(len as u64, &mut enc);
         enc.extend_from_slice(&payload);
         set.push("skip_value", Some(0x0A), &enc, "skipval-delimited-fit");
     }
@@ -889,6 +907,247 @@ fn gen_mini_table_corpus(set: &mut CaseSet) {
     }
 }
 
+fn gen_decode_known_corpus(set: &mut CaseSet) {
+    use mdgen::*;
+
+    // Descriptor helpers. Supported encoded types for this court: Bool(13),
+    // Int32(6), UInt32(7), SInt32(8), Int64(9), UInt64(10), SInt64(11),
+    // Fixed32(2), Fixed64(3), SFixed32(4), SFixed64(5), Float(1), Double(0),
+    // String(15), Bytes(14). No submessages/maps/groups/closed enums.
+    let scalar_types: &[(usize, &str)] = &[
+        (13, "bool"),
+        (6, "int32"),
+        (7, "uint32"),
+        (8, "sint32"),
+        (9, "int64"),
+        (10, "uint64"),
+        (11, "sint64"),
+        (2, "fixed32"),
+        (3, "fixed64"),
+        (4, "sfixed32"),
+        (5, "sfixed64"),
+        (1, "float"),
+        (0, "double"),
+        (15, "string"),
+        (14, "bytes"),
+    ];
+
+    // Single scalar/string fields with a representative set of wire values.
+    for &(t, name) in scalar_types {
+        let mut enc = MessageEncoder::new(0);
+        enc.field(1, t, 0);
+        let md = enc.finish();
+        // Values: zero, one, extremes, negative, overlong varints.
+        let mut values: Vec<Vec<u8>> = vec![];
+        for v in [0u64, 1, 2, 0x7F, 0x80, 0x3FFF, u32::MAX as u64, u64::MAX] {
+            let mut m = vec![0x08u8];
+            encode_varint(v, &mut m);
+            values.push(m);
+        }
+        // Overlong encodings of 1.
+        for n in 2..=10usize {
+            let mut m = vec![0x08u8];
+            encode_varint_overlong(1, n, &mut m);
+            values.push(m);
+        }
+        for (i, v) in values.iter().enumerate() {
+            set.push_md("decode_known", &md, v, &format!("dk-{name}-varint-{i}"));
+        }
+        // Fixed-width values for fixed types.
+        if matches!(t, 1 | 0 | 2 | 3 | 4 | 5) {
+            let (tag, n) = if matches!(t, 2 | 4 | 1) {
+                (0x0Du8, 4usize)
+            } else {
+                (0x09u8, 8usize)
+            };
+            for pat in [0u8, 0xFF, 0x01, 0x80] {
+                let mut m = vec![tag];
+                m.extend(std::iter::repeat_n(pat, n));
+                set.push_md("decode_known", &md, &m, &format!("dk-{name}-fixed"));
+            }
+        }
+        // Strings/bytes payloads.
+        if matches!(t, 15 | 14) {
+            for (payload, kind) in [
+                (vec![], "empty"),
+                (b"hello".to_vec(), "ascii"),
+                (vec![0xFFu8, 0xFE], "bad-utf8"),
+                (vec![0xE2, 0x82, 0xAC], "euro"),
+                (vec![0xC3, 0x28], "trunc-utf8"),
+                (vec![0xED, 0xA0, 0x80], "surrogate"),
+            ] {
+                let mut m = vec![0x0Au8];
+                encode_varint(payload.len() as u64, &mut m);
+                m.extend_from_slice(&payload);
+                set.push_md("decode_known", &md, &m, &format!("dk-{name}-{kind}"));
+            }
+            // Declared size extending past the input.
+            let mut m = vec![0x0Au8, 0x05];
+            m.extend_from_slice(b"hi");
+            set.push_md("decode_known", &md, &m, &format!("dk-{name}-overrun"));
+        }
+    }
+
+    // Truncations of a valid multi-field message.
+    {
+        let mut enc = MessageEncoder::new(0);
+        enc.field(1, 13, 0); // bool
+        enc.field(2, 7, 0); // uint32
+        enc.field(3, 15, 0); // string
+        let md = enc.finish();
+        let mut m = vec![0x08u8, 0x01, 0x10, 0x96, 0x01, 0x1A, 0x03, b'a', b'b', b'c'];
+        m.extend_from_slice(&[0x20, 0x01]); // unknown field 4
+        set.push_md("decode_known", &md, &m, "dk-multi");
+        for i in 0..m.len() {
+            set.push_md("decode_known", &md, &m[..i], &format!("dk-multi-trunc{i}"));
+        }
+        // Wrong wire types for each field.
+        set.push_md(
+            "decode_known",
+            &md,
+            &[0x0Du8, 0x01, 0x02, 0x03, 0x04],
+            "dk-wt-fixed-for-bool",
+        );
+        set.push_md(
+            "decode_known",
+            &md,
+            &[0x09u8, 0, 0, 0, 0, 0, 0, 0, 0],
+            "dk-wt-64-for-uint32",
+        );
+        set.push_md(
+            "decode_known",
+            &md,
+            &[0x0Au8, 0x01, 0x00],
+            "dk-wt-delim-for-bool",
+        );
+        set.push_md(
+            "decode_known",
+            &md,
+            &[0x08u8, 0x01],
+            "dk-wt-varint-for-string",
+        );
+        set.push_md(
+            "decode_known",
+            &md,
+            &[0x0Bu8, 0x00],
+            "dk-wt-group-for-uint32",
+        );
+    }
+
+    // Packed repeated fields.
+    for (t, name, lg2, tag) in [
+        (7usize, "puint32", 2usize, 0x0Au8),
+        (9, "pint64", 3, 0x0A),
+        (13, "pbool", 0, 0x0A),
+        (8, "psint32", 2, 0x0A),
+        (2, "pfixed32", 2, 0x0A),
+        (3, "pfixed64", 3, 0x0A),
+        (1, "pfloat", 2, 0x0A),
+    ] {
+        let mut enc = MessageEncoder::new(MSG_MOD_DEFAULT_IS_PACKED);
+        enc.field(1, t + REPEATED_BASE, 0);
+        let md = enc.finish();
+        let esz = 1usize << lg2;
+        // A valid packed payload of 3 elements.
+        let mut payload: Vec<u8> = vec![];
+        for _ in 0..3 {
+            payload.push(0x01);
+            payload.resize(payload.len() + esz - 1, 0x00);
+        }
+        let mut m = vec![tag];
+        encode_varint(payload.len() as u64, &mut m);
+        m.extend_from_slice(&payload);
+        set.push_md("decode_known", &md, &m, &format!("dk-{name}-valid"));
+        // Payload size not a multiple of the element size.
+        let mut m2 = vec![tag, (esz + 1) as u8];
+        m2.extend(std::iter::repeat_n(0x00u8, esz + 1));
+        set.push_md("decode_known", &md, &m2, &format!("dk-{name}-misaligned"));
+        // Payload extending past the input.
+        let mut m3 = vec![tag, 0x10];
+        m3.extend_from_slice(b"hi");
+        set.push_md("decode_known", &md, &m3, &format!("dk-{name}-overrun"));
+        // Unpacked elements (same wire as scalar varints for varint types).
+        if matches!(t, 7 | 9 | 13 | 8) {
+            let mut m4 = vec![0x08u8, 0x01, 0x08, 0x02, 0x08, 0x03];
+            set.push_md("decode_known", &md, &m4, &format!("dk-{name}-unpacked"));
+        }
+        // Truncated varint inside the packed payload (malformed).
+        if matches!(t, 7 | 9 | 13 | 8) {
+            let mut m5 = vec![tag, 0x02, 0xFF, 0xFF];
+            set.push_md("decode_known", &md, &m5, &format!("dk-{name}-trunc-varint"));
+        }
+    }
+
+    // Oneof messages.
+    {
+        let mut enc = MessageEncoder::new(0);
+        enc.field(1, 7, 0); // uint32
+        enc.field(2, 15, 0); // string
+        enc.field(3, 13, 0); // bool
+        enc.start_oneofs();
+        enc.oneof_field(1, true);
+        enc.oneof_field(2, false);
+        enc.oneof_field(3, false);
+        let md = enc.finish();
+        // Set each member in turn; switch between members.
+        set.push_md("decode_known", &md, &[0x08u8, 0x2A], "dk-oneof-1");
+        set.push_md(
+            "decode_known",
+            &md,
+            &[0x12u8, 0x02, b'h', b'i'],
+            "dk-oneof-2",
+        );
+        set.push_md("decode_known", &md, &[0x18u8, 0x01], "dk-oneof-3");
+        set.push_md(
+            "decode_known",
+            &md,
+            &[0x08, 0x2A, 0x12, 0x01, b'x', 0x18, 0x00],
+            "dk-oneof-switch",
+        );
+        // Unknown field within the oneof message.
+        set.push_md(
+            "decode_known",
+            &md,
+            &[0x20u8, 0x01, 0x08, 0x2A],
+            "dk-oneof-unknown",
+        );
+    }
+
+    // Repeated strings and bytes.
+    for (t, name) in [(15usize, "rstring"), (14, "rbytes")] {
+        let mut enc = MessageEncoder::new(0);
+        enc.field(1, t + REPEATED_BASE, 0);
+        let md = enc.finish();
+        for (payloads, kind) in [
+            (vec![b"ab".to_vec(), b"c".to_vec()], "two"),
+            (vec![vec![]], "one-empty"),
+            (vec![vec![0xFFu8], vec![0x00]], "non-ascii"),
+        ] {
+            let mut m = vec![];
+            for p in &payloads {
+                m.push(0x0A);
+                encode_varint(p.len() as u64, &mut m);
+                m.extend_from_slice(p);
+            }
+            set.push_md("decode_known", &md, &m, &format!("dk-{name}-{kind}"));
+        }
+    }
+
+    // Boundary lengths: wrap a valid message at the charter lengths.
+    {
+        let mut enc = MessageEncoder::new(0);
+        enc.field(1, 7, 0);
+        let md = enc.finish();
+        for len in [
+            1usize, 2, 7, 8, 15, 16, 17, 31, 32, 63, 64, 127, 128, 255, 256,
+        ] {
+            let mut m = vec![0x08u8, 0x01];
+            m.resize(len, 0x00);
+            set.push_md("decode_known", &md, &m, &format!("dk-len{len}"));
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut seed = DEFAULT_SEED;
@@ -922,6 +1181,7 @@ fn main() {
     gen_skip_group_corpus(&mut set);
     gen_decode_empty_corpus(&mut set);
     gen_mini_table_corpus(&mut set);
+    gen_decode_known_corpus(&mut set);
 
     fs::create_dir_all(&out).expect("create corpus dir");
     let cases_path = out.join("cases.jsonl");

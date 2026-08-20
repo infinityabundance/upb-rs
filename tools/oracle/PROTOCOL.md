@@ -86,6 +86,7 @@ already-parsed tag value (`field_number << 3 | wire_type`), decimal.
 | `skip_group`  | `upb_WireReader_SkipGroup`    | —   | recursive; depth limit 100 |
 | `decode_empty`| `upb_Decode` (empty mini table)| —   | real message decode; every field is unknown; see below |
 | `mini_table_inspect`| `upb_MiniTable_Build` | — | builds a mini table from a mini descriptor; see below |
+| `decode_known` | `upb_Decode` (mini table from descriptor) | — | real message decode with known fields; see below |
 | `ping`        | —                        | —   | protocol self-test |
 
 ## `mini_table_inspect`
@@ -140,9 +141,49 @@ surfaces as `malformed` (the skip path throws `kUpb_ErrorCode_Malformed`);
 `max_depth_exceeded` is reserved for the submessage-recursion path of later
 mini-table-backed ops.
 
+## `decode_known`
+
+Runs the **real** `upb_Decode` from the pinned library against a message whose
+mini table is built from a mini descriptor supplied in the request (the `md`
+field, lowercase hex of the raw descriptor bytes, e.g. `242d` for a single
+SInt64 field 1). Unlike `decode_empty`, the decoder takes the
+known-field path: per-field munge (`_upb_Decoder_Munge`, decode.c), hasbit
+presence, oneof case tracking, repeated/array population, packed decoding,
+and unknown-field retention for tags absent from the mini table. On success
+the oracle dumps the decoded state through the real accessor API:
+
+```json
+{"v":1,"id":1,"status":"ok","dump":{
+  "fields":[
+    {"number":1,"value":"01"},
+    {"number":2,"value":["68656c6c6f","776f726c64"]}
+  ],
+  "oneof_cases":[{"case_offset":12,"case":3}],
+  "unknown":"80 01"
+}}
+```
+
+- `dump.fields` lists only **present** fields, in mini-table index order.
+  `value` is lowercase hex of the stored representation (little-endian for
+  fixed-width scalars, raw bytes for String/Bytes), or an array of hex
+  elements for repeated fields. Field presence follows the mini table: hasbit
+  (`presence > 0`), oneof case match (`presence < 0`, `~presence` is the case
+  offset, `case == number`), or always-present proto3 singular.
+- `dump.oneof_cases` lists every distinct oneof case offset with its current
+  case value (0 = none set), sorted by offset.
+- `dump.unknown` is the concatenated hex of all retained unknown-field bytes
+  (string-view entries; the corpus never produces unknown groups or
+  submessage unknowns for this op).
+
+Request fields: `hex` (the message bytes), `md` (mini descriptor hex), `depth`
+(optional; as in `decode_empty`).
+
+Statuses: `ok` (with `dump`), or `error` with `code` one of `malformed`,
+`max_depth_exceeded`, `oom`, `minitable_build_failed`, `bad_hex`, `other`.
+
 ## Extensions
 
-New ops are additive and versioned by `"v"`. Ops that read a *message* through
-`upb_Decode` (with a mini table selected by descriptor) will be added as
-`decode_message` etc. in a later protocol version; they require the corpus
-generator to supply the mini table in the request.
+New ops are additive and versioned by `"v"`. The corpus generator supplies the
+mini table (as a mini descriptor) in the request; ops that need descriptor
+provenance beyond a mini descriptor (extensions, maps of messages, groups)
+will be added as `decode_message` variants in a later protocol version.

@@ -17,5 +17,6 @@
 //! `wire-primitives-v1` preserve this observable behavior.
 
 pub mod message;
+pub mod message_known;
 pub mod reader;
 pub mod stream;

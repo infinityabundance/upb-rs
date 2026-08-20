@@ -144,6 +144,7 @@ impl OracleClient {
             hex: String::new(),
             tag: None,
             depth: None,
+            md: None,
         })?;
         if resp.echo.as_deref() != Some("pong") {
             return Err(OracleError::Protocol("ping did not return pong".into()));
@@ -174,7 +175,20 @@ impl OracleClient {
             hex: crate::protocol::hex_encode(descriptor),
             tag: None,
             depth: None,
+            md: None,
         };
+        self.request(&req)
+    }
+
+    /// Sends a decode_known request (real upb_Decode with a mini table).
+    pub fn decode_known(
+        &mut self,
+        md: &[u8],
+        payload: &[u8],
+    ) -> Result<OracleResponse, OracleError> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let req = OracleRequest::decode_known(id, md, payload);
         self.request(&req)
     }
 }

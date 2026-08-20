@@ -24,6 +24,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "court-decode-known"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "upb-rs-casefile",
+ "upb-rs-core",
+ "upb-rs-mini-table",
+ "upb-rs-oracle",
+ "upb-rs-wire",
+]
+
+[[package]]
 name = "court-mini-table-inspect"
 version = "0.1.0"
 dependencies = [
@@ -187,6 +200,7 @@ dependencies = [
  "serde",
  "serde_json",
  "upb-rs-core",
+ "upb-rs-mini-table",
 ]
 
 [[package]]

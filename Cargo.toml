@@ -23,6 +23,7 @@ members = [
     "courts/wire-primitives",
     "courts/decode-empty",
     "courts/mini-table-inspect",
+    "courts/decode-known",
 ]
 
 [workspace.package]

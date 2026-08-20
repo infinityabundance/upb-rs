@@ -10,5 +10,6 @@ description = "Wire-format reader/encoder for upb-rs, mirroring upb/wire/reader.
 
 [dependencies]
 upb-rs-core = { version = "0.1.0", path = "../upb-rs-core" }
+upb-rs-mini-table = { version = "0.1.0", path = "../upb-rs-mini-table" }
 serde = { workspace = true }
 serde_json = { workspace = true }
