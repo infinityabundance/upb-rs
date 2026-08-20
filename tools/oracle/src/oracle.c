@@ -23,6 +23,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "upb/base/status.h"
+#include "upb/mem/arena.h"
+#include "upb/message/message.h"
+#include "upb/mini_descriptor/decode.h"
+#include "upb/wire/decode.h"
+#include "upb/wire/encode.h"
 #include "upb/wire/eps_copy_input_stream.h"
 #include "upb/wire/reader.h"
 #include "upb/wire/types.h"
@@ -310,6 +316,107 @@ static void run_skip_group(int64_t id, const char* hex, uint32_t tag) {
 }
 
 // ---------------------------------------------------------------------------
+// decode_empty: real upb_Decode into a message with an EMPTY (zero-field,
+// non-extendable) mini table, so every field is an unknown field. This is the
+// observable behavior of `_upb_Decoder_DecodeEmptyMessage`
+// (upb/wire/decode.c:1205-1239) plus the encoder's unknown-field emission:
+// on success we re-encode the message and return the bytes. Group recursion
+// depth is bounded by `depth` (0 -> kUpb_WireFormat_DefaultDepthLimit = 100).
+// ---------------------------------------------------------------------------
+
+static void emit_hex_out(const char* buf, size_t len) {
+  printf(",\"hex_out\":\"");
+  for (size_t i = 0; i < len; i++) {
+    printf("%02x", (unsigned char)buf[i]);
+  }
+  printf("\"");
+}
+
+static void run_decode_empty(int64_t id, const char* hex, int64_t depth) {
+  uint8_t input[MAX_INPUT_BYTES];
+  int n = parse_hex(hex, strlen(hex), input, sizeof(input));
+  if (n < 0) {
+    emit_header(id, "error");
+    emit_field_str("code", "bad_hex");
+    emit_end();
+    return;
+  }
+
+  upb_Arena* arena = upb_Arena_New();
+  if (!arena) {
+    emit_header(id, "error");
+    emit_field_str("code", "oom");
+    emit_end();
+    return;
+  }
+
+  upb_Status status;
+  upb_Status_Clear(&status);
+  upb_MiniTable* mt = upb_MiniTable_Build("", 0, arena, &status);
+  if (!mt) {
+    emit_header(id, "error");
+    emit_field_str("code", "minitable_build_failed");
+    emit_field_str("msg", status.msg);
+    emit_end();
+    upb_Arena_Free(arena);
+    return;
+  }
+
+  upb_Message* msg = upb_Message_New(mt, arena);
+  if (!msg) {
+    emit_header(id, "error");
+    emit_field_str("code", "oom");
+    emit_end();
+    upb_Arena_Free(arena);
+    return;
+  }
+
+  int options = 0;
+  if (depth > 0 && depth <= 65535) {
+    options = (int)upb_DecodeOptions_MaxDepth((uint16_t)depth);
+  }
+  upb_DecodeStatus ds = upb_Decode((const char*)input, (size_t)n, msg, mt, NULL,
+                                   options, arena);
+  if (ds == kUpb_DecodeStatus_Ok) {
+    size_t out_len = 0;
+    char* out_buf = NULL;
+    upb_EncodeStatus es = upb_Encode(msg, mt, 0, arena, &out_buf, &out_len);
+    if (es != kUpb_EncodeStatus_Ok) {
+      emit_header(id, "error");
+      emit_field_str("code", "encode_failed");
+      emit_end();
+      upb_Arena_Free(arena);
+      return;
+    }
+    emit_header(id, "ok");
+    emit_hex_out(out_buf, out_len);
+    emit_field_int("consumed", n);
+    emit_end();
+  } else if (ds == kUpb_DecodeStatus_Malformed) {
+    emit_header(id, "error");
+    emit_field_str("code", "malformed");
+    emit_field_int("consumed", 0);
+    emit_end();
+  } else if (ds == kUpb_DecodeStatus_MaxDepthExceeded) {
+    emit_header(id, "error");
+    emit_field_str("code", "max_depth_exceeded");
+    emit_field_int("consumed", 0);
+    emit_end();
+  } else if (ds == kUpb_DecodeStatus_OutOfMemory) {
+    emit_header(id, "error");
+    emit_field_str("code", "oom");
+    emit_field_int("consumed", 0);
+    emit_end();
+  } else {
+    emit_header(id, "error");
+    emit_field_str("code", "other");
+    emit_field_int("code_num", (int64_t)ds);
+    emit_end();
+  }
+  upb_Arena_Free(arena);
+}
+
+// ---------------------------------------------------------------------------
 // Main loop
 // ---------------------------------------------------------------------------
 
@@ -373,6 +480,10 @@ int main(void) {
         continue;
       }
       run_skip_group(id, hex, (uint32_t)tag);
+    } else if (strcmp(op, "decode_empty") == 0) {
+      int64_t depth = 0;
+      json_int(line, "\"depth\"", &depth);  // optional; 0 -> default 100
+      run_decode_empty(id, hex, depth);
     } else {
       emit_header(id, "error");
       emit_field_str("code", "unknown_op");

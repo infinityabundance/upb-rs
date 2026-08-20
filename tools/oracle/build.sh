@@ -30,6 +30,7 @@ mkdir -p "$ROOT/tools/oracle/build"
 cc -O2 -Wall -Wextra -I"$ROOT/third_party/protobuf" $extra_cflags \
    -o "$ROOT/tools/oracle/build/oracle" \
    "$ROOT/tools/oracle/src/oracle.c" \
-   "$ROOT/third_party/build/libupb.a"
+   "$ROOT/third_party/build/libupb.a" \
+   "$ROOT/third_party/build/third_party/utf8_range/libutf8_range.a"
 
 echo "oracle built: $ROOT/tools/oracle/build/oracle"

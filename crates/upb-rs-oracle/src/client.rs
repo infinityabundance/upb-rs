@@ -143,11 +143,24 @@ impl OracleClient {
             op: "ping".to_string(),
             hex: String::new(),
             tag: None,
+            depth: None,
         })?;
         if resp.echo.as_deref() != Some("pong") {
             return Err(OracleError::Protocol("ping did not return pong".into()));
         }
         Ok(())
+    }
+
+    /// Sends a decode_empty request (real upb_Decode, empty mini table).
+    pub fn decode_empty(
+        &mut self,
+        payload: &[u8],
+        depth: u32,
+    ) -> Result<OracleResponse, OracleError> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let req = OracleRequest::decode_empty(id, payload, depth);
+        self.request(&req)
     }
 }
 

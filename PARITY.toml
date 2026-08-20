@@ -47,6 +47,13 @@ court = "wire-primitives-v1"
 residuals = 0
 note = "skip_varint/skip_value/skip_group incl. depth limit 100, field-number-0 rejection, wire types 6/7 rejection, CheckSize discipline"
 
+[wire.decode.message_empty]
+status = "oracle-tested"
+oracle = "protobuf:2de70d710510ea7c5ad7ec0c72bfed7f411c7b60"
+court = "decode-empty-v1"
+residuals = 0
+note = "real upb_Decode with an empty mini table (pure unknown fields): status + byte-exact re-encode round-trip, group depth limits, hostile tags"
+
 [wire.decode.message]
 status = "unmapped"
 

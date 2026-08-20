@@ -16,5 +16,6 @@
 //! only surfaces at the next `IsDone()` check — exactly like upstream. Courts
 //! `wire-primitives-v1` preserve this observable behavior.
 
+pub mod message;
 pub mod reader;
 pub mod stream;

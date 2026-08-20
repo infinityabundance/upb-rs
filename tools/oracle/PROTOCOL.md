@@ -30,7 +30,8 @@ every request (even malformed ones), so courts can pair them by `id`.
 {"v":1,"id":6,"op":"skip_varint","hex":"ff80"}
 {"v":1,"id":7,"op":"skip_value","tag":10,"hex":"03aabbcc"}
 {"v":1,"id":8,"op":"skip_group","tag":11,"hex":"12 34 0c"}   // group body, tag = start-group tag value
-{"v":1,"id":9,"op":"ping"}
+{"v":1,"id":9,"op":"decode_empty","hex":"0801","depth":100}
+{"v":1,"id":10,"op":"ping"}
 ```
 
 `hex` is the payload (after any tag), lowercase hex, no spaces. `tag` is the
@@ -82,7 +83,37 @@ already-parsed tag value (`field_number << 3 | wire_type`), decimal.
 | `skip_varint` | `upb_WireReader_SkipVarint`   | —   | scans up to 10 bytes |
 | `skip_value`  | `upb_WireReader_SkipValue`    | —   | wire type from tag; depth limit 100 |
 | `skip_group`  | `upb_WireReader_SkipGroup`    | —   | recursive; depth limit 100 |
+| `decode_empty`| `upb_Decode` (empty mini table)| —   | real message decode; every field is unknown; see below |
 | `ping`        | —                        | —   | protocol self-test |
+
+## `decode_empty`
+
+Runs the **real** `upb_Decode` from the pinned library against a message
+whose mini table has zero fields and is non-extendable (built from the empty
+mini descriptor string). Every field on the wire is therefore an unknown
+field, exercising `_upb_Decoder_DecodeEmptyMessage`
+(`upb/wire/decode.c:1205-1239`) end-to-end: tag parsing, per-wire-type value
+skipping (including recursive depth-limited groups), the eps-copy stream
+state machine, and unknown-field storage. On success the message is
+re-encoded with `upb_Encode` and the bytes are returned in `hex_out`.
+
+Request fields: `hex` (the message bytes), `depth` (optional; 0 or absent
+selects `kUpb_WireFormat_DefaultDepthLimit` = 100; otherwise the value is
+packed into the decode options via `upb_DecodeOptions_MaxDepth`).
+
+Response:
+
+```json
+{"v":1,"id":1,"status":"ok","hex_out":"0801","consumed":2}
+{"v":1,"id":2,"status":"error","code":"malformed","consumed":0}
+```
+
+Statuses: `ok` (with `hex_out`), or `error` with `code` one of `malformed`,
+`max_depth_exceeded`, `oom`, `encode_failed`, `minitable_build_failed`,
+`bad_hex`, `other`. For the empty-mini-table surface, group depth overflow
+surfaces as `malformed` (the skip path throws `kUpb_ErrorCode_Malformed`);
+`max_depth_exceeded` is reserved for the submessage-recursion path of later
+mini-table-backed ops.
 
 ## Extensions
 

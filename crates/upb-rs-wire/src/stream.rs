@@ -140,6 +140,13 @@ impl EpsCopyStream {
         (size as isize) <= available
     }
 
+    /// Mirrors the `upb_EpsCopyCapture_End` bounds check
+    /// (`ptr - end > limit` fails); the stream position must not overrun the
+    /// current limit for a capture to be valid.
+    pub fn capture_ok(&self, ptr: usize) -> bool {
+        (ptr as isize - self.end as isize) <= self.limit
+    }
+
     /// Mirrors `upb_EpsCopyInputStream_ReturnError`: sets the error state and
     /// returns the malformed error.
     pub fn return_error(&mut self) -> Error {

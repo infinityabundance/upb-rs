@@ -14,6 +14,7 @@ happy-path tests.
 | wire decode: size         | ORACLE-TESTED | courts/wire-primitives (1537 cases, 0 residuals)       |
 | wire decode: fixed32/64   | ORACLE-TESTED | courts/wire-primitives (1537 cases, 0 residuals)       |
 | wire decode: skip         | ORACLE-TESTED | courts/wire-primitives (1537 cases, 0 residuals)       |
+| wire decode: message (empty mini table, pure unknown fields) | ORACLE-TESTED | courts/decode-empty (338 cases, 0 residuals) |
 | wire decode: message      | UNMAPPED      | —                                                     |
 | wire encode               | UNMAPPED      | —                                                     |
 | mini tables               | UNMAPPED      | —                                                     |

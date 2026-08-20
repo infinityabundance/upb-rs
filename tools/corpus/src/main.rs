@@ -33,6 +33,8 @@ struct Case {
     hex: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     tag: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    depth: Option<u64>,
     kind: String,
     seed: u64,
 }
@@ -94,6 +96,18 @@ impl CaseSet {
             op: op.to_string(),
             hex: hex(bytes),
             tag,
+            depth: None,
+            kind: kind.to_string(),
+            seed: self.seed,
+        });
+    }
+
+    fn push_depth(&mut self, op: &str, depth: u64, bytes: &[u8], kind: &str) {
+        self.cases.push(Case {
+            op: op.to_string(),
+            hex: hex(bytes),
+            tag: None,
+            depth: Some(depth),
             kind: kind.to_string(),
             seed: self.seed,
         });
@@ -428,6 +442,136 @@ fn gen_skip_group_corpus(set: &mut CaseSet) {
     set.push_truncations("skip_group", Some(0x0B), &complex, "skipgroup-trunc");
 }
 
+fn gen_decode_empty_corpus(set: &mut CaseSet) {
+    // Message-shaped inputs for the empty-mini-table decode surface.
+
+    // Single fields of every wire type, valid and truncated at every offset.
+    // varint field 1: tag 0x08
+    for v in [0u64, 1, 0x7F, 0x80, 0x3FFF, u64::MAX] {
+        let mut m = vec![0x08u8];
+        encode_varint(v, &mut m);
+        set.push_truncations("decode_empty", None, &m, "msg-varint");
+    }
+    // 32-bit field 1: tag 0x0D; 64-bit field 1: tag 0x09.
+    let pattern: Vec<u8> = (0..32u8).collect();
+    for (tag, kind) in [(0x0Du8, "msg-fixed32"), (0x09u8, "msg-fixed64")] {
+        for len in [1usize, 2, 4, 5, 8, 9, 16, 17, 32] {
+            let mut m = vec![tag];
+            m.extend_from_slice(&pattern[..len]);
+            set.push("decode_empty", None, &m, kind);
+        }
+        // Valid at exact lengths, truncated at every offset.
+        let mut m = vec![tag];
+        m.extend_from_slice(&pattern[..8]);
+        set.push_truncations("decode_empty", None, &m, kind);
+    }
+    // Delimited field 1: tag 0x0A, payloads of many sizes.
+    for size in [
+        0usize, 1, 2, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128, 255, 256,
+    ] {
+        let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        let mut m = vec![0x0Au8];
+        encode_varint(size as u64, &mut m);
+        m.extend_from_slice(&payload);
+        set.push("decode_empty", None, &m, "msg-delimited");
+    }
+    // Delimited declared sizes exceeding the payload.
+    for size in [1u64, 2, 7, 16, 128, 0x3FFF] {
+        let mut m = vec![0x0Au8];
+        encode_varint(size, &mut m);
+        m.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+        set.push("decode_empty", None, &m, "msg-delimited-overrun");
+    }
+    // Truncated size varints.
+    for trunc in [1usize, 2, 4] {
+        let mut m = vec![0x0Au8];
+        m.extend(std::iter::repeat_n(0xFFu8, trunc));
+        set.push("decode_empty", None, &m, "msg-delimited-sizetrunc");
+    }
+
+    // Multi-field messages: mixed wire types, out-of-order field numbers,
+    // duplicates.
+    let multi = [
+        0x08u8, 0x01, // field 1 varint = 1
+        0x15, 0x78, 0x56, 0x34, 0x12, // field 2 fixed32
+        0x18, 0x96, 0x01, // field 3 varint = 150
+        0x22, 0x03, 0xAA, 0xBB, 0xCC, // field 4 delimited
+        0x08, 0x02, // field 1 varint again (duplicate)
+        0x35, 0x01, 0x02, 0x03, 0x04, // field 6 fixed32
+    ];
+    set.push_truncations("decode_empty", None, &multi, "msg-multi");
+
+    // Out-of-order field numbers (descending).
+    let desc = [0x40u8, 0x01, 0x30, 0x02, 0x20, 0x03, 0x10, 0x04];
+    set.push_truncations("decode_empty", None, &desc, "msg-descending");
+
+    // Groups: nested at increasing depth (0x0B^d 0x0C^d pattern needs ends).
+    for d in [1usize, 2, 7, 8, 16, 32, 63, 64, 99, 100, 101] {
+        let mut m = Vec::new();
+        m.extend(std::iter::repeat_n(0x0Bu8, d - 1));
+        m.extend(std::iter::repeat_n(0x0Cu8, d));
+        set.push("decode_empty", None, &m, &format!("msg-group-depth{d}"));
+    }
+    // Group containing scalar fields.
+    let g = [0x0Bu8, 0x10, 0x01, 0x1A, 0x03, 0xAA, 0xBB, 0xCC, 0x0C];
+    set.push_truncations("decode_empty", None, &g, "msg-group-fields");
+    // Unterminated groups.
+    set.push(
+        "decode_empty",
+        None,
+        &[0x0Bu8, 0x10, 0x01],
+        "msg-group-unterminated",
+    );
+    set.push("decode_empty", None, &[0x0Bu8], "msg-group-bare");
+    // Group with wrong end-field number.
+    set.push(
+        "decode_empty",
+        None,
+        &[0x0Bu8, 0x10, 0x01, 0x14],
+        "msg-group-wrong-end",
+    );
+
+    // Hostile tags.
+    for tag in 0u8..=7 {
+        set.push("decode_empty", None, &[tag, 0x00], "msg-field0");
+    }
+    set.push("decode_empty", None, &[0x0Eu8, 0x00], "msg-wt6");
+    set.push("decode_empty", None, &[0x0Fu8, 0x00], "msg-wt7");
+    set.push("decode_empty", None, &[0x0Cu8], "msg-endgroup-top");
+    set.push("decode_empty", None, &[0x1Cu8], "msg-endgroup-top-f3");
+    // A 5-byte tag over UINT32_MAX.
+    set.push(
+        "decode_empty",
+        None,
+        &[0xFF, 0xFF, 0xFF, 0xFF, 0x10],
+        "msg-tag-over",
+    );
+    // Large field number, valid wire type.
+    let mut big = Vec::new();
+    encode_varint(((1u64 << 29) - 1) << 3, &mut big);
+    big.push(0x01);
+    set.push("decode_empty", None, &big, "msg-fieldnum-max");
+
+    // Depth parameter variants over group-nesting messages.
+    for d in [1usize, 2, 3, 4, 100, 101] {
+        let mut m = Vec::new();
+        m.extend(std::iter::repeat_n(0x0Bu8, d));
+        m.extend(std::iter::repeat_n(0x0Cu8, d + 1));
+        for depth in [1u64, 2, 3, 99, 100, 101] {
+            set.push_depth(
+                "decode_empty",
+                depth,
+                &m,
+                &format!("msg-depthopt-n{d}-d{depth}"),
+            );
+        }
+    }
+
+    // Boundary-length wrappings of a representative valid message.
+    let rep = [0x08u8, 0x01, 0x22, 0x03, 0xAA, 0xBB, 0xCC];
+    set.push_truncations("decode_empty", None, &rep, "msg-rep");
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut seed = DEFAULT_SEED;
@@ -459,6 +603,7 @@ fn main() {
     gen_skip_varint_corpus(&mut set);
     gen_skip_value_corpus(&mut set);
     gen_skip_group_corpus(&mut set);
+    gen_decode_empty_corpus(&mut set);
 
     fs::create_dir_all(&out).expect("create corpus dir");
     let cases_path = out.join("cases.jsonl");

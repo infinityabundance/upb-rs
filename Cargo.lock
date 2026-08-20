@@ -11,6 +11,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "court-decode-empty"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "upb-rs-casefile",
+ "upb-rs-core",
+ "upb-rs-oracle",
+ "upb-rs-wire",
+]
+
+[[package]]
 name = "court-wire-primitives"
 version = "0.1.0"
 dependencies = [

@@ -20,6 +20,7 @@ members = [
     "crates/upb-rs-casefile",
     "tools/corpus",
     "courts/wire-primitives",
+    "courts/decode-empty",
 ]
 
 [workspace.package]

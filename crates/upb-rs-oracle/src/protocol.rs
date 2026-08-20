@@ -36,6 +36,8 @@ pub struct OracleRequest {
     pub hex: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tag: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub depth: Option<u64>,
 }
 
 impl OracleRequest {
@@ -46,6 +48,7 @@ impl OracleRequest {
             op: op.as_str().to_string(),
             hex: hex_encode(payload),
             tag: None,
+            depth: None,
         }
     }
 
@@ -56,6 +59,7 @@ impl OracleRequest {
             op: "skip_value".to_string(),
             hex: hex_encode(payload),
             tag: Some(tag as u64),
+            depth: None,
         }
     }
 
@@ -66,6 +70,18 @@ impl OracleRequest {
             op: "skip_group".to_string(),
             hex: hex_encode(payload),
             tag: Some(tag as u64),
+            depth: None,
+        }
+    }
+
+    pub fn decode_empty(id: u64, payload: &[u8], depth: u32) -> OracleRequest {
+        OracleRequest {
+            v: 1,
+            id,
+            op: "decode_empty".to_string(),
+            hex: hex_encode(payload),
+            tag: None,
+            depth: Some(depth as u64),
         }
     }
 }
@@ -97,6 +113,9 @@ pub struct OracleResponse {
     pub code: Option<String>,
     #[serde(default)]
     pub echo: Option<String>,
+    /// decode_empty: the re-encoded bytes on success.
+    #[serde(default)]
+    pub hex_out: Option<String>,
 }
 
 impl OracleResponse {

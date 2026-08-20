@@ -244,10 +244,27 @@ fn main() {
     let cases_path = corpus_dir.join("cases.jsonl");
     let corpus_raw = fs::read_to_string(&cases_path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", cases_path.display()));
-    let cases: Vec<CorpusCase> = corpus_raw
+    let all_cases: Vec<CorpusCase> = corpus_raw
         .lines()
         .filter(|l| !l.trim().is_empty())
         .map(|l| serde_json::from_str(l).expect("parse corpus line"))
+        .collect();
+    // This court runs only its own primitive ops.
+    let cases: Vec<&CorpusCase> = all_cases
+        .iter()
+        .filter(|c| {
+            matches!(
+                c.op.as_str(),
+                "read_varint"
+                    | "read_tag"
+                    | "read_size"
+                    | "read_fixed32"
+                    | "read_fixed64"
+                    | "skip_varint"
+                    | "skip_value"
+                    | "skip_group"
+            )
+        })
         .collect();
     println!("loaded {} cases from {}", cases.len(), cases_path.display());
 
