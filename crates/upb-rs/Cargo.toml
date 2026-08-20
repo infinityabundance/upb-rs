@@ -1,6 +1,6 @@
 [package]
 name = "upb-rs"
-version.workspace = true
+version = "0.1.1"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -10,6 +10,6 @@ categories = ["encoding", "parser-implementations", "no-std"]
 
 [dependencies]
 upb-rs-core = { version = "0.1.0", path = "../upb-rs-core" }
-upb-rs-wire = { version = "0.1.0", path = "../upb-rs-wire" }
-upb-rs-oracle = { version = "0.1.0", path = "../upb-rs-oracle" }
+upb-rs-wire = { version = "0.1.1", path = "../upb-rs-wire" }
+upb-rs-oracle = { version = "0.1.1", path = "../upb-rs-oracle" }
 upb-rs-casefile = { version = "0.1.0", path = "../upb-rs-casefile" }
