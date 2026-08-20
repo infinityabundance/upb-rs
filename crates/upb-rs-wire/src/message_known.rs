@@ -84,7 +84,7 @@ impl Message {
     fn hasbit_set(&self, index: u16) -> bool {
         let byte = (index / 8) as usize;
         let bit = 1u8 << (index % 8);
-        self.buf.get(byte).map_or(false, |b| b & bit != 0)
+        self.buf.get(byte).is_some_and(|b| b & bit != 0)
     }
 
     fn set_hasbit(&mut self, index: u16) {
@@ -134,7 +134,7 @@ impl Message {
     }
 }
 
-fn find_field<'a>(mt: &'a MiniTable, number: u32) -> Option<&'a MiniTableField> {
+fn find_field(mt: &MiniTable, number: u32) -> Option<&MiniTableField> {
     mt.fields.iter().find(|f| f.number == number)
 }
 
@@ -318,7 +318,6 @@ pub fn decode_known(descriptor: &[u8], input: &[u8], max_depth: u32) -> Result<M
         };
         if op == Op::Unknown {
             ptr = decode_unknown_field(
-                &mt,
                 &mut msg,
                 &mut stream,
                 ptr,
@@ -368,7 +367,7 @@ pub fn decode_known(descriptor: &[u8], input: &[u8], max_depth: u32) -> Result<M
                     return Err(KnownDecodeError::Malformed);
                 }
                 let esz = 1usize << lg2;
-                if size % esz != 0 {
+                if !size.is_multiple_of(esz) {
                     return Err(KnownDecodeError::Malformed);
                 }
                 let arr = msg.arrays.entry(f.number as usize).or_default();
@@ -599,8 +598,13 @@ fn read_packed_varint(input: &[u8], pos: usize, end: usize) -> Result<(u64, usiz
 /// `ptr` is the position after the tag; `ptr_after_value` is the position
 /// after the value read (equal to `ptr` when nothing was read yet). `value`
 /// carries the already-read delimited size when applicable.
+///
+/// The parameter list mirrors the context threading of the upstream skip path
+/// (decode.c). clippy's arity threshold is deliberately exceeded; the
+/// alternatives (a context struct or closure capture) would obscure the
+/// one-to-one correspondence with `_upb_Decoder_SkipUnknown`'s operands.
+#[allow(clippy::too_many_arguments)]
 fn decode_unknown_field(
-    mt: &MiniTable,
     msg: &mut Message,
     stream: &mut EpsCopyStream,
     ptr: usize,
@@ -623,14 +627,13 @@ fn decode_unknown_field(
                 // (decode.c:1021-1023); nothing left to skip.
                 ptr_after_value
             } else {
-                let e = match wire_type {
+                match wire_type {
                     0 => {
                         reader::skip_varint(stream, ptr).map_err(|_| KnownDecodeError::Malformed)?
                     }
                     1 => ptr + 8,
                     _ => ptr + 4,
-                };
-                e
+                }
             }
         }
         2 => {
@@ -650,7 +653,7 @@ fn decode_unknown_field(
             size_end + size
         }
         3 => {
-            let tag = ((field_number << 3) | 3) as u32;
+            let tag = (field_number << 3) | 3;
             reader::skip_group_inner(stream, ptr, tag, depth)
                 .map_err(|_| KnownDecodeError::Malformed)?
         }
@@ -666,6 +669,5 @@ fn decode_unknown_field(
     if abs_start <= abs_end {
         msg.unknown.extend_from_slice(&input[abs_start..abs_end]);
     }
-    let _ = mt;
     Ok(end)
 }

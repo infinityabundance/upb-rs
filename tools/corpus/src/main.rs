@@ -954,7 +954,7 @@ fn gen_decode_known_corpus(set: &mut CaseSet) {
             set.push_md("decode_known", &md, v, &format!("dk-{name}-varint-{i}"));
         }
         // Fixed-width values for fixed types.
-        if matches!(t, 1 | 0 | 2 | 3 | 4 | 5) {
+        if matches!(t, 0..=5) {
             let (tag, n) = if matches!(t, 2 | 4 | 1) {
                 (0x0Du8, 4usize)
             } else {
@@ -1068,12 +1068,12 @@ fn gen_decode_known_corpus(set: &mut CaseSet) {
         set.push_md("decode_known", &md, &m3, &format!("dk-{name}-overrun"));
         // Unpacked elements (same wire as scalar varints for varint types).
         if matches!(t, 7 | 9 | 13 | 8) {
-            let mut m4 = vec![0x08u8, 0x01, 0x08, 0x02, 0x08, 0x03];
+            let m4 = vec![0x08u8, 0x01, 0x08, 0x02, 0x08, 0x03];
             set.push_md("decode_known", &md, &m4, &format!("dk-{name}-unpacked"));
         }
         // Truncated varint inside the packed payload (malformed).
         if matches!(t, 7 | 9 | 13 | 8) {
-            let mut m5 = vec![tag, 0x02, 0xFF, 0xFF];
+            let m5 = vec![tag, 0x02, 0xFF, 0xFF];
             set.push_md("decode_known", &md, &m5, &format!("dk-{name}-trunc-varint"));
         }
     }

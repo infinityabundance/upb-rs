@@ -293,10 +293,12 @@ mod tests {
     #[test]
     fn ten_byte_varint_max() {
         // 0xFF * 9 then 0x01: ten bytes, value wraps.
+        let bytes = [0xFF; 9];
+        let last = [0x01];
         let s = EpsCopyStream::init(
-            &[0xFF; 9]
+            bytes
                 .iter()
-                .chain(&[0x01])
+                .chain(&last)
                 .copied()
                 .collect::<Vec<_>>()
                 .as_slice(),
