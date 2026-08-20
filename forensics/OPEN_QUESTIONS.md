@@ -15,34 +15,35 @@ located. See Risks §5.
 
 ## 1. Current phase
 
-**Phase 0 (archaeology + court infrastructure)** is live, with the first
-court — **wire primitives** — already producing evidence: `varint`, `tag`,
-`size` are ORACLE-TESTED with 0 residuals (`PARITY.toml` `[wire.decode.*]`,
-`STATUS.md`), meaning the oracle protocol (tools/oracle) and the
-court-runner skeleton exist in some form. The forensic atlas set was
-populated on 2026-08-19 (this deliverable plus the sibling atlases
-SURFACE_ATLAS, MEMORY_MODEL, ERROR_MODEL, KERNEL_ATLAS, BEHAVIOR_ATLAS,
-QUIRKS, NONDETERMINISM, written concurrently in the same minute window;
-SOURCE_BASELINE.md is still absent, see Risks §5.3).
+**Phase 0 (archaeology + court infrastructure)** is complete: the forensic
+atlas set, pinned oracle, oracle protocol, casefile format, differential
+protocol, and the first courts are live (see STATUS.md). **Phase 1 (core
+representation + arena)** is now PARITY-SEALED: the ArenaPool, Array, and
+Map models are court-verified against the real upb_Arena / upb_Array /
+upb_Map (courts/arena 61/61, courts/collections 52/52, 0 residuals), and
+message storage / field presence / oneofs / unknown storage are sealed
+through the decode-known (517) and decode-submsg (93) courts. The message
+representation remains Vec-based (semantic parity; representation free per
+charter §8); arena-backed message storage is deferred to Phase 2, where
+map decode (`_upb_Decoder_DecodeToMap`) requires arena-backed maps/arrays
+inside the decode path anyway.
 
-Phase sequence `[INFERRED — charter absent; reconstructed from STATUS.md
-surface order, README layout, and the phase-0/phase-2 numbering already
-used in the repo. Verify against the charter when located.]`:
+Phase sequence (charter §43, now authoritative):
 
-| Phase | Deliverable |
-|---|---|
-| 0 | Archaeology + court infrastructure; first court (wire primitives) live. **current** |
-| 1 | Wire decode scalars: fixed32/64 court; varint/tag/size hardening corpus folded into security/ |
-| 2 | Message-level decode: generated minitables, message court, merge semantics |
-| 3 | Mini tables / mini descriptors: builder parity, fasttable-selection model, schema-synthesis engine |
-| 4 | Wire encode: byte-exact round-trip court (incl. deterministic maps, unknown order) |
-| 5 | Arena / memory: Rust arena semantic model, allocation-failure contract, RSS accounting |
-| 6 | Reflection / def pool: descriptor loading, symtab build, error taxonomy |
-| 7 | JSON: decode/encode courts, duplicate keys, well-known types, depth 64 |
-| 8 | Text format: parse/serialize (upb's text serializer exists; parser is NOT in upb — `upb/README.md:42`) |
-| 9 | Conformance: upstream suite (binary + JSON), performance list unblocked after §5-risk item |
-| 10 | Unknown fields / extensions / MessageSet: promotion courts, alias semantics |
-| 11 | Kernel integration & C ABI: `abi/` manifests, integration patch series, forbidden-linkage CI |
+| Phase | Deliverable | State |
+|---|---|---|
+| 0 | Archaeology + court infrastructure | DONE |
+| 1 | Core representation and arena (arena, strings/bytes, arrays, maps, message storage, presence, oneofs, unknown storage, core mini-table structures) | **PARITY-SEALED** |
+| 2 | Binary wire parity (decoder: maps/groups/closed enums; encoder; merge/clear/clone; unknown handling; deterministic mode) | **NEXT** |
+| 3 | Mini descriptors and generated metadata (schema-synthesis courts at scale) | pending |
+| 4 | Reflection, descriptors, extensions | pending |
+| 5 | JSON, text, well-known types | pending |
+| 6 | Full protobuf conformance | pending |
+| 7 | Official Rust protobuf kernel integration | pending |
+| 8 | Security and hostile-input seal | pending |
+| 9 | Performance and binary size | pending |
+| 10 | Version-scoped C compatibility | pending |
+| 11 | Real consumer substitution (Python/Ruby/PHP runtimes) | pending |
 
 ## 2. Immediate work queue (next 20)
 
