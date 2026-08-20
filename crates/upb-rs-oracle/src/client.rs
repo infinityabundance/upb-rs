@@ -166,6 +166,8 @@ impl OracleClient {
             mds: None,
             links: None,
             options: None,
+            b_hex: None,
+            script: None,
             arena: None,
             ops: None,
             gen_ops: None,
@@ -209,6 +211,8 @@ impl OracleClient {
             mds: None,
             links: None,
             options: None,
+            b_hex: None,
+            script: None,
             arena: None,
             ops: None,
             gen_ops: None,
@@ -263,6 +267,25 @@ impl OracleClient {
         let id = self.next_id;
         self.next_id += 1;
         let req = OracleRequest::encode(id, mds, links, payload, depth, options);
+        self.request(&req)
+    }
+
+    /// Sends a msgop request: decode `payload` (and `payload_b` for merge),
+    /// apply the script operation (merge/clear/clone), dump + re-encode.
+    #[allow(clippy::too_many_arguments)]
+    pub fn msgop(
+        &mut self,
+        mds: &[Vec<u8>],
+        links: &[Vec<u64>],
+        payload: &[u8],
+        payload_b: &[u8],
+        depth: u32,
+        options: u32,
+        script: &str,
+    ) -> Result<OracleResponse, OracleError> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let req = OracleRequest::msgop(id, mds, links, payload, payload_b, depth, options, script);
         self.request(&req)
     }
 

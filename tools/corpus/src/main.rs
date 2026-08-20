@@ -47,6 +47,12 @@ struct Case {
     /// encode: the upb_Encode options word (Deterministic = 1, SkipUnknown = 2).
     #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<u64>,
+    /// msgop: the second payload (merge source), hex.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    b_hex: Option<String>,
+    /// msgop: the operation script ("merge" | "clear" | "clone").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    script: Option<String>,
     kind: String,
     seed: u64,
 }
@@ -113,6 +119,8 @@ impl CaseSet {
             mds: None,
             links: None,
             options: None,
+            b_hex: None,
+            script: None,
             kind: kind.to_string(),
             seed: self.seed,
         });
@@ -128,6 +136,8 @@ impl CaseSet {
             mds: None,
             links: None,
             options: None,
+            b_hex: None,
+            script: None,
             kind: kind.to_string(),
             seed: self.seed,
         });
@@ -144,6 +154,8 @@ impl CaseSet {
             mds: Some(mds.iter().map(|m| hex(m)).collect()),
             links: Some(links.to_vec()),
             options: None,
+            b_hex: None,
+            script: None,
             kind: kind.to_string(),
             seed: self.seed,
         });
@@ -167,6 +179,8 @@ impl CaseSet {
             mds: Some(mds.iter().map(|m| hex(m)).collect()),
             links: Some(links.to_vec()),
             options: None,
+            b_hex: None,
+            script: None,
             kind: kind.to_string(),
             seed: self.seed,
         });
@@ -192,6 +206,38 @@ impl CaseSet {
             mds: Some(mds.iter().map(|m| hex(m)).collect()),
             links: Some(links.to_vec()),
             options: Some(options),
+            b_hex: None,
+            script: None,
+            kind: kind.to_string(),
+            seed: self.seed,
+        });
+    }
+
+    /// msgop case: decode `a` (and `b` for merge), apply the script
+    /// operation, dump + re-encode under `options`/`depth`.
+    #[allow(clippy::too_many_arguments)]
+    fn push_msgop(
+        &mut self,
+        mds: &[Vec<u8>],
+        links: &[Vec<u64>],
+        a: &[u8],
+        b: &[u8],
+        depth: u64,
+        options: u64,
+        script: &str,
+        kind: &str,
+    ) {
+        self.cases.push(Case {
+            op: "msgop".to_string(),
+            hex: hex(a),
+            tag: None,
+            depth: Some(depth),
+            md: None,
+            mds: Some(mds.iter().map(|m| hex(m)).collect()),
+            links: Some(links.to_vec()),
+            options: Some(options),
+            b_hex: Some(hex(b)),
+            script: Some(script.to_string()),
             kind: kind.to_string(),
             seed: self.seed,
         });
@@ -207,6 +253,8 @@ impl CaseSet {
             mds: None,
             links: None,
             options: None,
+            b_hex: None,
+            script: None,
             kind: kind.to_string(),
             seed: self.seed,
         });
@@ -2610,6 +2658,325 @@ fn gen_encode_corpus(set: &mut CaseSet) {
     }
 }
 
+/// Message-operation cases (oracle op `msgop`): decode A (and B for merge),
+/// apply upb_Message_MergeFrom / Clear / DeepClone, dump + re-encode. The
+/// court derives clear/clone over every decode_submsg payload; this generator
+/// adds the explicit merge pairs and the depth-boundary ops. MergeFrom is
+/// encode(src, options 0, depth 100) then decode into dst (merge.c:14-38), so
+/// the merge itself never contributes unknowns beyond src's re-encoded bytes.
+fn gen_msgop_corpus(set: &mut CaseSet) {
+    use mdgen::*;
+
+    // Scalar overwrite; empty src/dst; unknown concatenation order (dst's
+    // unknowns first, then src's, in src wire order).
+    {
+        let mds = vec![md_fields(&[(1, 7)])]; // A { uint32 x = 1; } ($))
+        let links = vec![vec![]];
+        set.push_msgop(
+            &mds,
+            &links,
+            &[0x08, 0x01],
+            &[0x08, 0x02],
+            0,
+            0,
+            "merge",
+            "mg-scalar-overwrite",
+        );
+        set.push_msgop(
+            &mds,
+            &links,
+            &[],
+            &[0x08, 0x02],
+            0,
+            0,
+            "merge",
+            "mg-empty-dst",
+        );
+        set.push_msgop(
+            &mds,
+            &links,
+            &[0x08, 0x01],
+            &[],
+            0,
+            0,
+            "merge",
+            "mg-empty-src",
+        );
+        set.push_msgop(
+            &mds,
+            &links,
+            &[],
+            &[0x08, 0x02],
+            0,
+            0,
+            "merge",
+            "mg-empty-both",
+        );
+        // dst unknown (field 2 fixed32) then src unknown (field 3 fixed32).
+        set.push_msgop(
+            &mds,
+            &links,
+            &[0x15, 0x00, 0x00, 0x00, 0x00],
+            &[0x1D, 0x02, 0x00, 0x00, 0x00],
+            0,
+            0,
+            "merge",
+            "mg-unknown-append",
+        );
+        set.push_msgop(
+            &mds,
+            &links,
+            &[0x08, 0x01, 0x15, 0x00, 0x00, 0x00, 0x00],
+            &[0x1D, 0x02, 0x00, 0x00, 0x00],
+            0,
+            0,
+            "merge",
+            "mg-unknown-with-field",
+        );
+        // Overlong unknown varints survive the merge unchanged (raw spans).
+        set.push_msgop(
+            &mds,
+            &links,
+            &[0x15, 0x00, 0x00, 0x00, 0x00],
+            &[0x18, 0x85, 0x00],
+            0,
+            0,
+            "merge",
+            "mg-unknown-overlong",
+        );
+    }
+    // Sub-message merge: A { B b = 1; } ($3) B { uint32 x; int32 y; } ($)(.
+    {
+        let mds = vec![md_fields(&[(1, 17)]), md_fields(&[(1, 7), (2, 6)])];
+        let links = vec![vec![1], vec![]];
+        set.push_msgop(
+            &mds,
+            &links,
+            &[0x0A, 0x02, 0x08, 0x01],
+            &[0x0A, 0x02, 0x10, 0x02],
+            0,
+            0,
+            "merge",
+            "mg-submsg-merge",
+        );
+        set.push_msgop(
+            &mds,
+            &links,
+            &[0x0A, 0x02, 0x08, 0x01],
+            &[0x0A, 0x02, 0x08, 0x02],
+            0,
+            0,
+            "merge",
+            "mg-submsg-overwrite",
+        );
+        set.push_msgop(
+            &mds,
+            &links,
+            &[0x0A, 0x00],
+            &[0x0A, 0x02, 0x08, 0x01],
+            0,
+            0,
+            "merge",
+            "mg-submsg-into-empty",
+        );
+        set.push_msgop(
+            &mds,
+            &links,
+            &[0x0A, 0x04, 0x08, 0x01, 0x10, 0x01],
+            &[0x0A, 0x02, 0x08, 0x02],
+            0,
+            0,
+            "merge",
+            "mg-submsg-deep-merge",
+        );
+        // Unknown inside the sub-message merges into the same sub-message.
+        set.push_msgop(
+            &mds,
+            &links,
+            &[0x0A, 0x03, 0x15, 0x00, 0x00, 0x00, 0x00],
+            &[0x0A, 0x03, 0x1D, 0x01, 0x00, 0x00, 0x00],
+            0,
+            0,
+            "merge",
+            "mg-submsg-unknown-merge",
+        );
+    }
+    // Repeated append.
+    {
+        let mds = vec![md_fields(&[(1, 7 + REPEATED_BASE)])];
+        let links = vec![vec![]];
+        set.push_msgop(
+            &mds,
+            &links,
+            &[0x08, 0x01],
+            &[0x08, 0x02],
+            0,
+            0,
+            "merge",
+            "mg-repeated-append",
+        );
+        set.push_msgop(
+            &mds,
+            &links,
+            &[0x0A, 0x03, 0x01, 0x02, 0x03],
+            &[0x08, 0x04],
+            0,
+            0,
+            "merge",
+            "mg-packed-then-unpacked",
+        );
+        set.push_msgop(
+            &mds,
+            &links,
+            &[],
+            &[0x08, 0x01, 0x08, 0x02],
+            0,
+            0,
+            "merge",
+            "mg-repeated-from-empty",
+        );
+    }
+    // Map insert / last-wins (protoc-shape map field).
+    {
+        let mds = vec![md_fields(&[(1, 17 + REPEATED_BASE)]), map_descriptor(7, 6)];
+        let links = vec![vec![1], vec![]];
+        set.push_msgop(
+            &mds,
+            &links,
+            &[0x0A, 0x04, 0x08, 0x01, 0x10, 0x07],
+            &[0x0A, 0x04, 0x08, 0x02, 0x10, 0x08],
+            0,
+            0,
+            "merge",
+            "mg-map-insert",
+        );
+        set.push_msgop(
+            &mds,
+            &links,
+            &[0x0A, 0x04, 0x08, 0x01, 0x10, 0x07],
+            &[0x0A, 0x04, 0x08, 0x01, 0x10, 0x08],
+            0,
+            0,
+            "merge",
+            "mg-map-last-wins",
+        );
+        // Deterministic re-encode after merge.
+        set.push_msgop(
+            &mds,
+            &links,
+            &[0x0A, 0x04, 0x08, 0x01, 0x10, 0x07],
+            &[0x0A, 0x04, 0x08, 0x02, 0x10, 0x08],
+            0,
+            1,
+            "merge",
+            "mg-map-merge-det",
+        );
+    }
+    // Oneof switch / same-member overwrite.
+    {
+        let mds = vec![md_oneof(&[(1, 7), (2, 6)])];
+        let links = vec![vec![]];
+        set.push_msgop(
+            &mds,
+            &links,
+            &[0x08, 0x01],
+            &[0x10, 0x02],
+            0,
+            0,
+            "merge",
+            "mg-oneof-switch",
+        );
+        set.push_msgop(
+            &mds,
+            &links,
+            &[0x08, 0x01],
+            &[0x08, 0x02],
+            0,
+            0,
+            "merge",
+            "mg-oneof-same-member",
+        );
+    }
+    // Group merge: repeated occurrences merge like sub-messages.
+    {
+        let mds = vec![md_fields(&[(1, 16)]), md_fields(&[(1, 7)])];
+        let links = vec![vec![1], vec![]];
+        set.push_msgop(
+            &mds,
+            &links,
+            &[0x0B, 0x08, 0x01, 0x0C],
+            &[0x0B, 0x0C],
+            0,
+            0,
+            "merge",
+            "mg-group-merge",
+        );
+    }
+    // Closed enum: an invalid value in src re-encodes as an unknown field
+    // that the merge decodes back into dst's unknowns.
+    {
+        let mds = vec![md_fields(&[(1, 18)]), enum_descriptor(&[1, 2])];
+        let links = vec![vec![1], vec![]];
+        set.push_msgop(
+            &mds,
+            &links,
+            &[0x08, 0x01],
+            &[0x08, 0x05],
+            0,
+            0,
+            "merge",
+            "mg-enum-invalid-src",
+        );
+    }
+    // Clear / clone over the deep recursive schema with explicit depths
+    // (clear yields the empty message; a 100-deep clone fails to re-encode at
+    // depth 100 — the encode `--depth == 0` boundary).
+    {
+        let mds = vec![md_fields(&[(1, 17)])];
+        let links = vec![vec![0]];
+        set.push_msgop(
+            &mds,
+            &links,
+            &recursive_payload(50),
+            &[],
+            50,
+            0,
+            "clear",
+            "mgc-clear-deep50",
+        );
+        set.push_msgop(
+            &mds,
+            &links,
+            &recursive_payload(100),
+            &[],
+            100,
+            0,
+            "clone",
+            "mgc-clone-deep100",
+        );
+        set.push_msgop(
+            &mds,
+            &links,
+            &recursive_payload(100),
+            &[],
+            100,
+            1,
+            "clone",
+            "mgc-clone-deep100-det",
+        );
+        set.push_msgop(
+            &mds,
+            &links,
+            &recursive_payload(99),
+            &[],
+            100,
+            0,
+            "clone",
+            "mgc-clone-deep99",
+        );
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut seed = DEFAULT_SEED;
@@ -2646,6 +3013,7 @@ fn main() {
     gen_decode_known_corpus(&mut set);
     gen_decode_submsg_corpus(&mut set);
     gen_encode_corpus(&mut set);
+    gen_msgop_corpus(&mut set);
 
     fs::create_dir_all(&out).expect("create corpus dir");
     let cases_path = out.join("cases.jsonl");

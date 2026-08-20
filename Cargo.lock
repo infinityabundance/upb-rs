@@ -92,6 +92,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "court-msgop"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "upb-rs-casefile",
+ "upb-rs-oracle",
+ "upb-rs-wire",
+]
+
+[[package]]
 name = "court-wire-primitives"
 version = "0.1.0"
 dependencies = [
@@ -195,7 +206,7 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
 name = "upb-rs"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "upb-rs-casefile",
  "upb-rs-core",
@@ -231,7 +242,7 @@ dependencies = [
 
 [[package]]
 name = "upb-rs-oracle"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -239,7 +250,7 @@ dependencies = [
 
 [[package]]
 name = "upb-rs-wire"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "serde",
  "serde_json",

@@ -25,8 +25,11 @@
 
 #include "upb/base/status.h"
 #include "upb/mem/arena.h"
+#include "upb/message/accessors.h"
 #include "upb/message/array.h"
+#include "upb/message/copy.h"
 #include "upb/message/map.h"
+#include "upb/message/merge.h"
 #include "upb/message/message.h"
 #include "upb/message/unknown_fields.h"
 #include "upb/mini_descriptor/decode.h"
@@ -1251,6 +1254,249 @@ static void run_encode(int64_t id, const char* hex, int64_t depth,
   free(out_hex);
   upb_Arena_Free(arena);
 }
+
+// ---------------------------------------------------------------------------
+// msgop: decode payload A (and B for merge) over the pool, apply one message
+// operation, then dump + re-encode the result. script: "merge"
+// (upb_Message_MergeFrom — internally encode(src, options 0) then decode into
+// dst, both at the DEFAULT max depth; merge.c:14-38), "clear"
+// (upb_Message_Clear, accessors.h:38), "clone" (upb_Message_DeepClone,
+// copy.h:26-28). The re-encode uses the case options + max depth, like the
+// encode op.
+// ---------------------------------------------------------------------------
+
+static void run_msgop(int64_t id, const char* hex, const char* b_hex,
+                      int64_t depth, int64_t options, const char* script,
+                      char mds[][MAX_INPUT_BYTES], int n_mds,
+                      int64_t links[][64], int* link_lens) {
+  uint8_t input[MAX_INPUT_BYTES];
+  int n = parse_hex(hex, strlen(hex), input, sizeof(input));
+  if (n < 0) {
+    emit_header(id, "error");
+    emit_field_str("code", "bad_hex");
+    emit_end();
+    return;
+  }
+
+  upb_Arena* arena = upb_Arena_New();
+  if (!arena) {
+    emit_header(id, "error");
+    emit_field_str("code", "oom");
+    emit_end();
+    return;
+  }
+  upb_Status status;
+  upb_Status_Clear(&status);
+
+  upb_MiniTable* tables[MAX_TABLES] = {0};
+  upb_MiniTableEnum* enum_tables[MAX_TABLES] = {0};
+  int is_enum[MAX_TABLES] = {0};
+  for (int t = 0; t < n_mds; t++) {
+    uint8_t desc[MAX_INPUT_BYTES];
+    int dn = parse_hex(mds[t], strlen(mds[t]), desc, sizeof(desc));
+    if (dn < 0) {
+      emit_header(id, "error");
+      emit_field_str("code", "bad_hex");
+      emit_end();
+      upb_Arena_Free(arena);
+      return;
+    }
+    if (dn > 0 && desc[0] == '!') {
+      enum_tables[t] =
+          upb_MiniTableEnum_Build((const char*)desc, (size_t)dn, arena, &status);
+      if (!enum_tables[t]) {
+        emit_header(id, "error");
+        emit_field_str("code", "enum_build_failed");
+        emit_end();
+        upb_Arena_Free(arena);
+        return;
+      }
+      is_enum[t] = 1;
+    } else {
+      tables[t] =
+          upb_MiniTable_Build((const char*)desc, (size_t)dn, arena, &status);
+      if (!tables[t]) {
+        emit_header(id, "error");
+        emit_field_str("code", "minitable_build_failed");
+        printf(",\"msg\":");
+        emit_json_string_raw(status.msg);
+        emit_end();
+        upb_Arena_Free(arena);
+        return;
+      }
+    }
+  }
+
+  for (int t = 0; t < n_mds; t++) {
+    if (is_enum[t]) continue;
+    int slot = 0;
+    int fc = upb_MiniTable_FieldCount(tables[t]);
+    for (int i = 0; i < fc; i++) {
+      upb_MiniTableField* f = (upb_MiniTableField*)upb_MiniTable_GetFieldByIndex(
+          tables[t], (uint32_t)i);
+      if (f->submsg_ofs_dont_copy_me__upb_internal_use_only == kUpb_NoSub_) {
+        continue;
+      }
+      if (slot >= link_lens[t]) break;
+      int target = (int)links[t][slot];
+      if (target < 0 || target >= n_mds) {
+        emit_header(id, "error");
+        emit_field_str("code", "bad_links");
+        emit_end();
+        upb_Arena_Free(arena);
+        return;
+      }
+      bool linked = is_enum[target]
+                        ? upb_MiniTable_SetSubEnum(tables[t], f,
+                                                   enum_tables[target])
+                        : upb_MiniTable_SetSubMessage(tables[t], f,
+                                                      tables[target]);
+      if (!linked) {
+        emit_header(id, "error");
+        emit_field_str("code", "link_failed");
+        emit_end();
+        upb_Arena_Free(arena);
+        return;
+      }
+      slot++;
+    }
+  }
+
+  upb_Message* msg = upb_Message_New(tables[0], arena);
+  if (!msg) {
+    emit_header(id, "error");
+    emit_field_str("code", "oom");
+    emit_end();
+    upb_Arena_Free(arena);
+    return;
+  }
+
+  int decode_options = 0;
+  if (depth > 0 && depth <= 65535) {
+    decode_options = (int)upb_DecodeOptions_MaxDepth((uint16_t)depth);
+  }
+  upb_DecodeStatus ds = upb_Decode((const char*)input, (size_t)n, msg,
+                                   tables[0], NULL, decode_options, arena);
+  if (ds != kUpb_DecodeStatus_Ok) {
+    emit_header(id, "error");
+    if (ds == kUpb_DecodeStatus_Malformed) {
+      emit_field_str("code", "malformed");
+    } else if (ds == kUpb_DecodeStatus_BadUtf8) {
+      emit_field_str("code", "bad_utf8");
+    } else if (ds == kUpb_DecodeStatus_MaxDepthExceeded) {
+      emit_field_str("code", "max_depth_exceeded");
+    } else if (ds == kUpb_DecodeStatus_OutOfMemory) {
+      emit_field_str("code", "oom");
+    } else {
+      emit_field_str("code", "other");
+      emit_field_int("code_num", (int64_t)ds);
+    }
+    emit_end();
+    upb_Arena_Free(arena);
+    return;
+  }
+
+  upb_Message* target = msg;
+  if (strcmp(script, "merge") == 0) {
+    uint8_t b[MAX_INPUT_BYTES];
+    int bn = parse_hex(b_hex, strlen(b_hex), b, sizeof(b));
+    if (bn < 0) {
+      emit_header(id, "error");
+      emit_field_str("code", "bad_hex");
+      emit_end();
+      upb_Arena_Free(arena);
+      return;
+    }
+    upb_Message* src = upb_Message_New(tables[0], arena);
+    if (!src) {
+      emit_header(id, "error");
+      emit_field_str("code", "oom");
+      emit_end();
+      upb_Arena_Free(arena);
+      return;
+    }
+    upb_DecodeStatus bds = upb_Decode((const char*)b, (size_t)bn, src,
+                                      tables[0], NULL, decode_options, arena);
+    if (bds != kUpb_DecodeStatus_Ok) {
+      emit_header(id, "error");
+      if (bds == kUpb_DecodeStatus_Malformed) {
+        emit_field_str("code", "malformed");
+      } else if (bds == kUpb_DecodeStatus_BadUtf8) {
+        emit_field_str("code", "bad_utf8");
+      } else if (bds == kUpb_DecodeStatus_MaxDepthExceeded) {
+        emit_field_str("code", "max_depth_exceeded");
+      } else {
+        emit_field_str("code", "oom");
+      }
+      emit_end();
+      upb_Arena_Free(arena);
+      return;
+    }
+    if (!upb_Message_MergeFrom(msg, src, tables[0], NULL, arena)) {
+      emit_header(id, "error");
+      emit_field_str("code", "merge_failed");
+      emit_end();
+      upb_Arena_Free(arena);
+      return;
+    }
+  } else if (strcmp(script, "clear") == 0) {
+    upb_Message_Clear(msg, tables[0]);
+  } else if (strcmp(script, "clone") == 0) {
+    target = upb_Message_DeepClone(msg, tables[0], arena);
+    if (!target) {
+      emit_header(id, "error");
+      emit_field_str("code", "oom");
+      emit_end();
+      upb_Arena_Free(arena);
+      return;
+    }
+  } else {
+    emit_header(id, "error");
+    emit_field_str("code", "bad_script");
+    emit_end();
+    upb_Arena_Free(arena);
+    return;
+  }
+
+  int encode_options = (int)options & 0xffff;
+  if (depth > 0 && depth <= 65535) {
+    encode_options |= (int)upb_EncodeOptions_MaxDepth((uint16_t)depth);
+  }
+  char* buf = NULL;
+  size_t size = 0;
+  upb_EncodeStatus es =
+      upb_Encode(target, tables[0], encode_options, arena, &buf, &size);
+  if (es != kUpb_EncodeStatus_Ok) {
+    emit_header(id, "error");
+    if (es == kUpb_EncodeStatus_MaxDepthExceeded) {
+      emit_field_str("code", "max_depth_exceeded");
+    } else {
+      emit_field_str("code", "encode_failed");
+      emit_field_int("code_num", (int64_t)es);
+    }
+    emit_end();
+    upb_Arena_Free(arena);
+    return;
+  }
+  char* out_hex = malloc(size * 2 + 1);
+  if (!out_hex) {
+    emit_header(id, "error");
+    emit_field_str("code", "oom");
+    emit_end();
+    upb_Arena_Free(arena);
+    return;
+  }
+  for (size_t i = 0; i < size; i++) {
+    sprintf(&out_hex[i * 2], "%02x", (unsigned char)buf[i]);
+  }
+  out_hex[size * 2] = '\0';
+  emit_header(id, "ok");
+  emit_dump(target, tables[0]);
+  emit_field_str("hex_out", out_hex);
+  emit_end();
+  free(out_hex);
+  upb_Arena_Free(arena);
+}
 //
 // Build-configuration note: kUpb_MemblockReserve / kUpb_ArenaStateReserve /
 // kUpb_Asan_GuardSize are file-scope/private at this pin, so `arena_info`
@@ -2227,6 +2473,29 @@ int main(void) {
         continue;
       }
       run_encode(id, hex, depth, options, mds, n_mds, links, link_lens);
+    } else if (strcmp(op, "msgop") == 0) {
+      char mds[MAX_TABLES][MAX_INPUT_BYTES] = {{0}};
+      int64_t links[MAX_TABLES][64] = {{0}};
+      int link_lens[MAX_TABLES] = {0};
+      int64_t depth = 0;
+      int64_t options = 0;
+      char b_hex[MAX_INPUT_BYTES * 2 + 1] = {0};
+      char script[32] = {0};
+      int n_mds = json_string_array(line, "\"mds\"", mds, MAX_TABLES);
+      int n_links = json_int_array2(line, "\"links\"", links, link_lens,
+                                    MAX_TABLES);
+      json_int(line, "\"depth\"", &depth);
+      json_int(line, "\"options\"", &options);
+      json_string(line, "\"b_hex\"", b_hex, sizeof(b_hex));
+      json_string(line, "\"script\"", script, sizeof(script));
+      if (n_mds < 1 || n_links != n_mds || script[0] == '\0') {
+        emit_header(id, "error");
+        emit_field_str("code", "bad_request");
+        emit_end();
+        continue;
+      }
+      run_msgop(id, hex, b_hex, depth, options, script, mds, n_mds, links,
+                link_lens);
     } else if (strcmp(op, "arena_info") == 0) {
       run_arena_info(id);
     } else if (strcmp(op, "arena_trace") == 0) {

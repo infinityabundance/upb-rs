@@ -247,6 +247,12 @@ pub struct OracleRequest {
     /// SkipUnknown = 2; encode.h:29-43).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub options: Option<u64>,
+    /// msgop: the second payload (merge source), hex.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub b_hex: Option<String>,
+    /// msgop: the operation script ("merge" | "clear" | "clone").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub script: Option<String>,
     /// arena_trace: the arena configuration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub arena: Option<ArenaCfg>,
@@ -289,6 +295,8 @@ impl OracleRequest {
             mds: None,
             links: None,
             options: None,
+            b_hex: None,
+            script: None,
             arena: None,
             ops: None,
             gen_ops: None,
@@ -313,6 +321,8 @@ impl OracleRequest {
             mds: None,
             links: None,
             options: None,
+            b_hex: None,
+            script: None,
             arena: None,
             ops: None,
             gen_ops: None,
@@ -337,6 +347,8 @@ impl OracleRequest {
             mds: None,
             links: None,
             options: None,
+            b_hex: None,
+            script: None,
             arena: None,
             ops: None,
             gen_ops: None,
@@ -361,6 +373,8 @@ impl OracleRequest {
             mds: None,
             links: None,
             options: None,
+            b_hex: None,
+            script: None,
             arena: None,
             ops: None,
             gen_ops: None,
@@ -385,6 +399,8 @@ impl OracleRequest {
             mds: None,
             links: None,
             options: None,
+            b_hex: None,
+            script: None,
             arena: None,
             ops: None,
             gen_ops: None,
@@ -415,6 +431,8 @@ impl OracleRequest {
             mds: Some(mds.iter().map(|m| hex_encode(m)).collect()),
             links: Some(links.to_vec()),
             options: None,
+            b_hex: None,
+            script: None,
             arena: None,
             ops: None,
             gen_ops: None,
@@ -449,6 +467,47 @@ impl OracleRequest {
             mds: Some(mds.iter().map(|m| hex_encode(m)).collect()),
             links: Some(links.to_vec()),
             options: Some(options as u64),
+            b_hex: None,
+            script: None,
+            arena: None,
+            ops: None,
+            gen_ops: None,
+            a: None,
+            a_ops: None,
+            b: None,
+            b_ops: None,
+            post_ops: None,
+            free: None,
+        }
+    }
+
+    /// msgop: decode `payload` (and `payload_b` for merge) over the pool with
+    /// max depth `depth`, apply the script operation (merge/clear/clone), then
+    /// dump + re-encode under `options` and max depth `depth`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn msgop(
+        id: u64,
+        mds: &[Vec<u8>],
+        links: &[Vec<u64>],
+        payload: &[u8],
+        payload_b: &[u8],
+        depth: u32,
+        options: u32,
+        script: &str,
+    ) -> OracleRequest {
+        OracleRequest {
+            v: 1,
+            id,
+            op: "msgop".to_string(),
+            hex: hex_encode(payload),
+            tag: None,
+            depth: Some(depth as u64),
+            md: None,
+            mds: Some(mds.iter().map(|m| hex_encode(m)).collect()),
+            links: Some(links.to_vec()),
+            options: Some(options as u64),
+            b_hex: Some(hex_encode(payload_b)),
+            script: Some(script.to_string()),
             arena: None,
             ops: None,
             gen_ops: None,
@@ -473,6 +532,8 @@ impl OracleRequest {
             mds: None,
             links: None,
             options: None,
+            b_hex: None,
+            script: None,
             arena: None,
             ops: None,
             gen_ops: None,
@@ -502,6 +563,8 @@ impl OracleRequest {
             mds: None,
             links: None,
             options: None,
+            b_hex: None,
+            script: None,
             arena: Some(arena),
             ops: Some(ops.to_vec()),
             gen_ops: None,
@@ -533,6 +596,8 @@ impl OracleRequest {
             mds: None,
             links: None,
             options: None,
+            b_hex: None,
+            script: None,
             arena: None,
             ops: None,
             gen_ops: None,
@@ -558,6 +623,8 @@ impl OracleRequest {
             mds: None,
             links: None,
             options: None,
+            b_hex: None,
+            script: None,
             arena: Some(arena),
             ops: None,
             gen_ops: Some(ops.to_vec()),

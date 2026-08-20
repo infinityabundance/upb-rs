@@ -26,6 +26,7 @@ members = [
     "courts/decode-known",
     "courts/decode-submsg",
     "courts/encode",
+    "courts/msgop",
     "courts/arena",
     "courts/collections",
 ]

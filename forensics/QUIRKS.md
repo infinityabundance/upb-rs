@@ -436,3 +436,26 @@ history before the protobuf repo merge is squashed; see NONDETERMINISM.md §1.3)
   encoder.c:579-592) regardless of zero values, wrapped as
   `[map-tag][len][key][val]` — unlike the AddMapEntryUnknown re-encode,
   which applies the entry's own hasbit presence.
+
+## 18. Message operations (sealed in msgop-v1, 544/544)
+
+- **`upb_Message_MergeFrom` is encode(src) then decode-into-dst**
+  (merge.c:14-38) with options 0 and the DEFAULT max depth for both — the
+  merge budget is fixed at 100 regardless of any caller depth. Observable
+  consequences: merged unknowns are dst's first, then src's in src wire
+  order; scalar overwrite / recursive sub-message merge / repeated append /
+  map last-wins / oneof last-wins all follow the sealed decode semantics;
+  a corpus-shape map in src re-encodes (options 0, non-deterministic) and
+  the dst's map hasbit stays UNSET (DecodeToMap sets no presence), so the
+  merged map is still skipped on a later encode.
+- **`upb_Message_Clear` yields the empty message** (accessors.h:38;
+  internal/accessors.h:876-885): aux memory (unknowns) is dropped — the
+  observable is no fields, no unknowns, empty re-encode.
+- **`upb_Message_DeepClone` re-sets presence on copied collection fields**:
+  `_upb_Message_Copy` memcpys the message area (hasbits included) and then
+  calls `upb_Message_SetBaseField` for every non-NULL map/array/sub-message
+  and non-empty string (copy.c:186-287; SetBaseField → SetPresence,
+  internal/accessors.h:323-331). A corpus-shape map field — whose hasbit
+  the decoder never set — therefore gains its hasbit on the clone, and the
+  clone re-encodes the map while the original does not (casefile
+  mop-clone-map-hasbit). The DUT mirrors this recursively.

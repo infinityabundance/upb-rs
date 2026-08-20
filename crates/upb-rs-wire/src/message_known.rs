@@ -1635,6 +1635,142 @@ pub fn encode_known(
     encode_message_inner(&msg, &ts, 0, depth, options)
 }
 
+/// A message operation (the oracle's `msgop` op): the observable contract of
+/// `upb_Message_MergeFrom` / `upb_Message_Clear` / `upb_Message_DeepClone`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MsgOp {
+    Merge,
+    Clear,
+    Clone,
+}
+
+/// Decodes `input_a` (and `input_b` for Merge), applies one message
+/// operation, and re-encodes the result under `options`/`max_depth`.
+///
+/// * Merge — `upb_Message_MergeFrom(dst, src, mt, NULL, arena)`
+///   (merge.c:14-38): the source is serialized (options 0, DEFAULT max depth)
+///   and decoded into the destination (options 0, DEFAULT max depth), so the
+///   merge budget is fixed at 100 regardless of the case depth; scalar
+///   overwrite, sub-message merge, repeated append, map last-wins insert, and
+///   unknown concatenation (dst's unknowns first, then src's in src wire
+///   order) all follow the sealed decode semantics.
+/// * Clear — `upb_Message_Clear` (accessors.h:38): the message is zeroed
+///   and its aux storage reset; the observable is the empty message.
+/// * Clone — `upb_Message_DeepClone` (copy.h:26-28): the observable equals
+///   the source (the model's `Message` is an owned value).
+pub fn msgop_submsg(
+    mds: &[&[u8]],
+    links: &[&[usize]],
+    input_a: &[u8],
+    input_b: &[u8],
+    max_depth: u32,
+    options: u32,
+    op: MsgOp,
+) -> Result<(Message, Vec<u8>)> {
+    let ts = TableSet::from_pool(mds, links)?;
+    reject_deferred(&ts)?;
+    let depth = effective_depth(max_depth);
+    let mut msg = Message::new(ts.main().size as usize);
+    let mut stream = EpsCopyStream::init(input_a);
+    let mut ptr = 0usize;
+    decode_message(
+        &ts,
+        0,
+        &mut msg,
+        &mut stream,
+        &mut ptr,
+        depth,
+        input_a,
+        None,
+    )?;
+    match op {
+        MsgOp::Merge => {
+            let mut src = Message::new(ts.main().size as usize);
+            let mut s2 = EpsCopyStream::init(input_b);
+            let mut p2 = 0usize;
+            decode_message(&ts, 0, &mut src, &mut s2, &mut p2, depth, input_b, None)?;
+            // MergeFrom hardcodes options 0 and the default max depth for
+            // both the internal encode and decode (merge.c:26-31).
+            let bytes = encode_message_inner(&src, &ts, 0, reader::DEFAULT_DEPTH_LIMIT, 0)?;
+            let mut s3 = EpsCopyStream::init(&bytes);
+            let mut p3 = 0usize;
+            decode_message(
+                &ts,
+                0,
+                &mut msg,
+                &mut s3,
+                &mut p3,
+                reader::DEFAULT_DEPTH_LIMIT,
+                &bytes,
+                None,
+            )?;
+        }
+        MsgOp::Clear => {
+            msg = Message::new(ts.main().size as usize);
+        }
+        MsgOp::Clone => {
+            msg = msg.clone();
+            // `upb_Message_DeepClone` (copy.c:296-304) re-sets presence on
+            // copied map/array/sub-message fields; the DUT mirrors that with
+            // the recursive map-hasbit fix (casefile mop-clone-map-hasbit).
+            clone_set_map_presence(&mut msg, &ts, 0);
+        }
+    }
+    let bytes = encode_message_inner(&msg, &ts, 0, depth, options)?;
+    Ok((msg, bytes))
+}
+
+/// `_upb_Message_Copy` (copy.c:186-287) re-sets presence on every copied
+/// map/array/sub-message/string via `upb_Message_SetBaseField`
+/// (internal/accessors.h:323-331): the leading memcpy already copied the
+/// hasbits, but a MAP field whose hasbit the decoder never set
+/// (`_upb_Decoder_DecodeToMap` sets no presence) gains its hasbit on the
+/// clone — observable because the clone then re-encodes the map
+/// (`encode_shouldencode`, encoder.c:642-678; casefile
+/// mop-clone-map-hasbit). Applied recursively, mirroring DeepClone's
+/// recursive sub-message copying.
+fn clone_set_map_presence(msg: &mut Message, ts: &TableSet, table_idx: usize) {
+    let mt = ts.table(table_idx);
+    for (i, f) in mt.fields.iter().enumerate() {
+        let num = f.number as usize;
+        match f.mode_class() {
+            FieldMode::Map => {
+                if f.presence > 0 && msg.maps.get(&num).is_some_and(|m| !m.is_empty()) {
+                    msg.set_hasbit(f.presence as u16);
+                }
+                if let (Some(entry_idx), Some(entries)) =
+                    (ts.sub(table_idx, i), msg.maps.get_mut(&num))
+                {
+                    if let Some(val_sub) = ts.sub(entry_idx, 1) {
+                        for e in entries.iter_mut() {
+                            if let MapValue::Message(m) = &mut e.value {
+                                clone_set_map_presence(m, ts, val_sub);
+                            }
+                        }
+                    }
+                }
+            }
+            FieldMode::Array if f.descriptortype == 11 || f.descriptortype == 10 => {
+                if let Some(elems) = msg.submsg_arrays.get_mut(&num) {
+                    if let Some(sub) = ts.sub(table_idx, i) {
+                        for e in elems.iter_mut() {
+                            clone_set_map_presence(e, ts, sub);
+                        }
+                    }
+                }
+            }
+            FieldMode::Scalar if f.descriptortype == 11 || f.descriptortype == 10 => {
+                if let Some(sm) = msg.submsgs.get_mut(&num) {
+                    if let Some(sub) = ts.sub(table_idx, i) {
+                        clone_set_map_presence(sm, ts, sub);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// `_upb_Encode` for the supported surface: unknown bytes first (dropped under
 /// SkipUnknown), then present fields in field-number order, mirroring the
 /// net output of the backward-buffer encoder (internal/encoder.c:764-816).
@@ -2798,5 +2934,124 @@ mod tests {
             encode_submsg(&mds, &links, &input, 0, ENCODE_OPTION_SKIP_UNKNOWN).unwrap(),
             [0x08, 0x01]
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Message-operation courts (unit-level regression pins; the differential
+    // evidence is the msgop-v1 court, 544/544 sealed).
+    // ---------------------------------------------------------------------
+
+    /// Merge = encode(src, options 0) then decode into dst (merge.c:14-38):
+    /// scalars overwrite, submessages merge recursively, unknowns append
+    /// (dst's first, then src's in src wire order).
+    #[test]
+    fn msgop_merge_scalar_and_unknown() {
+        // A { uint32 x = 1; } ($)).
+        let mds = [&[0x24, 0x29][..]];
+        let links = [&[][..]];
+        let (msg, bytes) = msgop_submsg(
+            &mds,
+            &links,
+            &[0x08, 0x01],
+            &[0x08, 0x02],
+            0,
+            0,
+            MsgOp::Merge,
+        )
+        .unwrap();
+        assert_eq!(bytes, [0x08, 0x02]);
+        assert_eq!(msg.buf[12..16], 2u32.to_le_bytes());
+        // dst unknown (field 2 fixed32) then src unknown (field 3 fixed32).
+        let (_, bytes) = msgop_submsg(
+            &mds,
+            &links,
+            &[0x15, 0x00, 0x00, 0x00, 0x00],
+            &[0x1D, 0x02, 0x00, 0x00, 0x00],
+            0,
+            0,
+            MsgOp::Merge,
+        )
+        .unwrap();
+        assert_eq!(
+            bytes,
+            [0x15, 0x00, 0x00, 0x00, 0x00, 0x1D, 0x02, 0x00, 0x00, 0x00]
+        );
+    }
+
+    /// Merge of sub-messages is recursive; repeated fields append.
+    #[test]
+    fn msgop_merge_submsg_and_repeated() {
+        // A { B b = 1; } ($3) B { uint32 x; int32 y; } ($)(.
+        let mds = [&[0x24, 0x33][..], &[0x24, 0x29, 0x28][..]];
+        let links = [&[1usize][..], &[][..]];
+        let (msg, bytes) = msgop_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x02, 0x08, 0x01],
+            &[0x0A, 0x02, 0x10, 0x02],
+            0,
+            0,
+            MsgOp::Merge,
+        )
+        .unwrap();
+        assert_eq!(bytes, [0x0A, 0x04, 0x08, 0x01, 0x10, 0x02]);
+        let sub = msg.submsgs.get(&1).expect("submsg");
+        assert_eq!(sub.buf[12..16], 1u32.to_le_bytes()); // x = 1
+        assert_eq!(sub.buf[16..20], 2u32.to_le_bytes()); // y = 2
+                                                         // Repeated append.
+        let mds = [&[0x24, 0x3D][..]]; // $= = repeated uint32 (base92 27).
+        let links = [&[][..]];
+        let (msg, bytes) = msgop_submsg(
+            &mds,
+            &links,
+            &[0x08, 0x01],
+            &[0x08, 0x02],
+            0,
+            0,
+            MsgOp::Merge,
+        )
+        .unwrap();
+        assert_eq!(bytes, [0x08, 0x01, 0x08, 0x02]);
+        assert_eq!(msg.arrays.get(&1).unwrap().len(), 2);
+    }
+
+    /// DeepClone re-sets presence on copied map fields (`SetBaseField`,
+    /// internal/accessors.h:323-331): a corpus-shape map field whose hasbit
+    /// the decoder never set gains it on the clone, which then re-encodes the
+    /// map (casefile mop-clone-map-hasbit).
+    #[test]
+    fn msgop_clone_sets_map_presence() {
+        let mds = [&[0x24, 0x33][..], &[0x25, 0x29, 0x28][..]]; // $3 + entry %)(
+        let links = [&[1usize][..], &[][..]];
+        let (_, bytes) = msgop_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x04, 0x08, 0x05, 0x10, 0x07],
+            &[],
+            0,
+            0,
+            MsgOp::Clone,
+        )
+        .unwrap();
+        assert_eq!(bytes, [0x0A, 0x04, 0x08, 0x05, 0x10, 0x07]);
+    }
+
+    /// Clear yields the empty message (unknowns dropped; accessors.h:38).
+    #[test]
+    fn msgop_clear_empty() {
+        let mds = [&[0x24, 0x29][..]];
+        let links = [&[][..]];
+        let (msg, bytes) = msgop_submsg(
+            &mds,
+            &links,
+            &[0x08, 0x01, 0x15, 0x00, 0x00, 0x00, 0x00],
+            &[],
+            0,
+            0,
+            MsgOp::Clear,
+        )
+        .unwrap();
+        assert!(bytes.is_empty());
+        assert!(msg.unknown.is_empty());
     }
 }

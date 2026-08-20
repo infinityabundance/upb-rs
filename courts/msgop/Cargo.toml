@@ -1,8 +1,8 @@
 [package]
-name = "court-encode"
+name = "court-msgop"
 version = "0.1.0"
 edition = "2021"
-description = "Differential court: decode-then-re-encode (upb_Decode + upb_Encode) with options 0/Deterministic/SkipUnknown, oracle (real upb_Encode over a pool of linked mini tables) vs DUT (upb-rs-wire encode_submsg/encode_known)"
+description = "Differential court: message operations (upb_Message_MergeFrom / Clear / DeepClone) over a pool of linked mini tables, oracle vs DUT"
 
 [dependencies]
 upb-rs-casefile = { version = "0.1.0", path = "../../crates/upb-rs-casefile" }

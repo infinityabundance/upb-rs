@@ -77,9 +77,13 @@ Phase sequence (charter §43, now authoritative):
     unknown re-emission, sign-extension/zigzag, packed-flag form selection,
     backward-buffer ordering, deterministic reversed sort (int ascending /
     string descending-byte), SkipUnknown, and the encode/decode depth
-    off-by-one. Next Phase-2 encoder items: merge/clear/clone and
-    unknown-handling courts (upb_Message_MergeFrom / Clear semantics,
-    unknown-field ordering across merge — §3.3).
+    off-by-one.
+11. **[DONE 2026-08-20] Message-operation court (merge/clear/clone)**: sealed
+    in msgop-v1 (544/544, 543 byte-exact + 1 classified map-order).
+    MergeFrom = encode(src, options 0, depth 100) + decode-into-dst; Clear
+    yields the empty message; DeepClone re-sets presence on copied
+    map/array/sub-message fields (casefile mop-clone-map-hasbit). Next:
+    unknown-handling courts (discard-unknown is reflection-level, Phase 4).
 11. **Depth-limit boundary court**: decode 99/100/101 nested; encode depth;
     unknown-group SkipGroup budget (100); JSON 64 — all as separate
     surfaces.
@@ -127,13 +131,13 @@ Phase sequence (charter §43, now authoritative):
    is an explicit risk (SECURITY.md:287-337). How: oracle `json_decode` on
    duplicate-key payloads; cross-check `upb/json/decode_test.cc` and the
    conformance JSON suite.
-3. **[OPEN] Unknown-field ordering across merge.** Unknowns append to
-   `aux_data` (`upb/message/internal/message.c:56-103`) and encode iterates
-   in reverse (`encoder.c:778-798`); merging two messages interleaves
-   unknowns and fields — the exact final byte order (and where new unknowns
-   go relative to a previously parsed field region) is observable and not
-   derivable from source alone. How: oracle `merge` + `encode` byte
-   comparison on interleaved payloads.
+3. **[RESOLVED 2026-08-20] Unknown-field ordering across merge.**
+   `upb_Message_MergeFrom` is encode(src) then decode-into-dst
+   (merge.c:14-38), so the merged message's unknowns are dst's unknowns
+   FIRST, then src's unknowns in src wire order (the decoder appends new
+   unknowns after existing ones; decode.c:1010-1081). Pinned byte-exactly
+   by the msgop-v1 court (`mg-unknown-append`, `mg-unknown-with-field`,
+   `mg-unknown-overlong` — overlong raw spans survive the merge).
 4. **[OPEN] Fasttable selection completeness.** `select.c` criteria are
    readable, but the *observable* question is whether any schema/input
    combination produces different decode output (or different error status)

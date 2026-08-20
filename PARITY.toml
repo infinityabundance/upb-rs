@@ -117,6 +117,13 @@ court = "collections-v1"
 residuals = 0
 note = "upb_Map content semantics: insert (last-wins, inserted/replaced status), get, delete, iterate; bool/uint32/double/string keys and values incl. hostile bit patterns. The map's internal table layout and arena footprint are representation; iteration is compared as a sorted set (NONDETERMINISM.md). 52/52 cases equal (map cases share the collections-v1 run). Court exposed an oracle-emitter bug (iterate must start at kUpb_Map_Begin)."
 
+[message_ops]
+status = "parity-sealed"
+oracle = "protobuf:2de70d710510ea7c5ad7ec0c72bfed7f411c7b60"
+court = "msgop-v1"
+residuals = 0
+note = "upb_Message_MergeFrom / Clear / DeepClone over every sealed decode case (clear + clone derived) plus explicit merge pairs. 544/544 equal (543 byte-exact + 1 classified map-order). Merge is encode(src, options 0, depth 100) + decode-into-dst (merge.c:14-38): scalar overwrite, recursive sub-message merge, repeated append, map last-wins, unknown concatenation (dst's first, then src's in src wire order), oneof last-wins. Clear yields the empty message. DeepClone re-sets presence on copied map/array/sub-message fields (copy.c:186-287 SetBaseField), so a corpus-shape map gains its hasbit on the clone and re-encodes (casefile mop-clone-map-hasbit)."
+
 [reflection]
 status = "unmapped"
 
