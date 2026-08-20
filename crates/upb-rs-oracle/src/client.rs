@@ -165,6 +165,7 @@ impl OracleClient {
             md: None,
             mds: None,
             links: None,
+            options: None,
             arena: None,
             ops: None,
             gen_ops: None,
@@ -207,6 +208,7 @@ impl OracleClient {
             md: None,
             mds: None,
             links: None,
+            options: None,
             arena: None,
             ops: None,
             gen_ops: None,
@@ -244,6 +246,23 @@ impl OracleClient {
         let id = self.next_id;
         self.next_id += 1;
         let req = OracleRequest::decode_submsg(id, mds, links, payload, depth);
+        self.request(&req)
+    }
+
+    /// Sends an encode request: the oracle decodes the payload over the pool
+    /// (max depth `depth`) and re-encodes with the real upb_Encode under
+    /// `options` (Deterministic = 1, SkipUnknown = 2) and max depth `depth`.
+    pub fn encode(
+        &mut self,
+        mds: &[Vec<u8>],
+        links: &[Vec<u64>],
+        payload: &[u8],
+        depth: u32,
+        options: u32,
+    ) -> Result<OracleResponse, OracleError> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let req = OracleRequest::encode(id, mds, links, payload, depth, options);
         self.request(&req)
     }
 

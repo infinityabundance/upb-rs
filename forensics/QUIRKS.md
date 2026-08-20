@@ -399,3 +399,40 @@ history before the protobuf repo merge is squashed; see NONDETERMINISM.md §1.3)
   codes and the DUT's `Unsupported` refusal are the same observable class
   (schema rejected before decoding) and are compared as such in the court;
   the exact oracle code is retained in residual records for audit.
+
+## 17. Encoder specifics (sealed in encode-v1, 3129/3129)
+
+- **`encode_shouldencode` is not `field_present`**: presence-less
+  (proto3-singular/map/array) fields encode iff the stored value is
+  non-zero / the collection non-empty, hasbit fields iff the bit is set,
+  oneof members iff the case matches (encoder.c:642-678). In particular a
+  MAP field built from a singular message descriptor keeps a hasbit the
+  decoder never sets (`_upb_Decoder_DecodeToMap`, decode.c:474-535, sets
+  no presence), so such maps decode but are SKIPPED on encode — while
+  protoc-generated map fields (repeated message + link, presence-less)
+  encode normally. Both shapes are in the corpus (`mp-*` skipped,
+  `enpm-*` encoded).
+- **Deterministic map output is the REVERSED sorted order**: the mapsorter
+  sorts entries (int keys ascending by uintptr; string keys bytewise
+  DESCENDING — the negated memcmp in `_upb_mapsorter_cmpstr`,
+  map_sorter.c:76-83 — with ascending-size tie-break) and the encoder
+  iterates the sorted map forward while building the buffer backwards, so
+  the emitted bytes come out reversed (encoder.c:594-640). The inttable
+  comparator ignores signedness (ascending uintptr always); the signed
+  comparators in `compar[]` are dead code for int maps.
+- **Encode/decode depth off-by-one**: the decoder errors at
+  `--depth < 0` (decode.c:196) so D nested levels decode at max depth D;
+  the encoder errors at `--depth == 0` (encoder.c:426, 441, 539, 556) so
+  D nested levels FAIL to encode at max depth D. A message that decodes at
+  exactly the boundary does not re-encode.
+- **The packed flag selects the encoded form**: a packed wire input for a
+  field whose descriptor lacks the packed flag re-encodes UNPACKED, and
+  vice versa (encode_array, encoder.c:460) — the flag is a serialization
+  preference, not a decode constraint.
+- **Unknowns emit after fields** in the forward output (written first into
+  the backward buffer → high addresses; encoder.c:776-798); SkipUnknown
+  drops them (encode.h:38-39).
+- **Map entries always emit key and value** (`encode_mapentry`,
+  encoder.c:579-592) regardless of zero values, wrapped as
+  `[map-tag][len][key][val]` — unlike the AddMapEntryUnknown re-encode,
+  which applies the entry's own hasbit presence.

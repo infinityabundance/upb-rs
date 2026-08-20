@@ -76,7 +76,11 @@ residuals = 0
 note = "MiniTableEnum build + link (SetSubEnum incl. map-entry include-0 rule) + decode: invalid scalar/unpacked values become unknown fields with the raw span preserved (overlong encodings kept); invalid packed values are re-encoded as [minimal tag][minimal varint]; valid values store as int32 (low 32 bits of the wire varint, matching CheckValue's uint32_t truncation); negative values via 10-byte sign-extended varints; sparse tails and mask expansion; packed varints overrunning the payload limit are malformed."
 
 [wire.encode]
-status = "unmapped"
+status = "parity-sealed"
+oracle = "protobuf:2de70d710510ea7c5ad7ec0c72bfed7f411c7b60"
+court = "encode-v1"
+residuals = 0
+note = "decode-then-re-encode (upb_Decode + upb_Encode) over every sealed decode case (4 option sets: 0/Deterministic/SkipUnknown/both) plus encode-specific cases. 3129/3129 equal (3127 byte-exact + 2 classified non-deterministic map order). Sealed behaviors: encode_shouldencode presence (hasbit map fields skipped — DecodeToMap never sets them; protoc-shape maps are presence-less and encode), unknown re-emission after fields, sign-extended int32/enum varints, zigzag, packed flag selects the encoded form, backward-buffer ordering (deterministic map output is the REVERSED mapsorter order; string keys bytewise-descending with ascending-size tie-break), encode depth off-by-one vs decode (--depth == 0 vs < 0)."
 
 [mini_table]
 status = "oracle-tested"

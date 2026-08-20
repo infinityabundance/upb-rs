@@ -34,7 +34,7 @@ Phase sequence (charter §43, now authoritative):
 |---|---|---|
 | 0 | Archaeology + court infrastructure | DONE |
 | 1 | Core representation and arena (arena, strings/bytes, arrays, maps, message storage, presence, oneofs, unknown storage, core mini-table structures) | **PARITY-SEALED** |
-| 2 | Binary wire parity (decoder: maps/groups/closed enums; encoder; merge/clear/clone; unknown handling; deterministic mode) | **NEXT** (decoder sub-items sealed; encoder court next) |
+| 2 | Binary wire parity (decoder: maps/groups/closed enums; encoder; merge/clear/clone; unknown handling; deterministic mode) | **NEXT** (decoder + encoder sealed; merge/clear/clone + unknown-handling courts next) |
 | 3 | Mini descriptors and generated metadata (schema-synthesis courts at scale) | pending |
 | 4 | Reflection, descriptors, extensions | pending |
 | 5 | JSON, text, well-known types | pending |
@@ -72,8 +72,14 @@ Phase sequence (charter §43, now authoritative):
    bytes.
 9. **Unknown-fields court**: order across `MergeFrom`/`decode`/`promote`,
    coalescing, alias-vs-copy, round-trip byte order (SECURITY_HISTORY §4).
-10. **Encode court**: byte-exact round-trip against oracle for all schema
-    classes; reverse-iteration order; packed back-patch lengths.
+10. **[DONE 2026-08-20] Encode court**: sealed in encode-v1 (3129/3129,
+    3127 byte-exact + 2 classified map-order). Covers presence semantics,
+    unknown re-emission, sign-extension/zigzag, packed-flag form selection,
+    backward-buffer ordering, deterministic reversed sort (int ascending /
+    string descending-byte), SkipUnknown, and the encode/decode depth
+    off-by-one. Next Phase-2 encoder items: merge/clear/clone and
+    unknown-handling courts (upb_Message_MergeFrom / Clear semantics,
+    unknown-field ordering across merge — §3.3).
 11. **Depth-limit boundary court**: decode 99/100/101 nested; encode depth;
     unknown-group SkipGroup budget (100); JSON 64 — all as separate
     surfaces.
@@ -165,12 +171,17 @@ Phase sequence (charter §43, now authoritative):
    exact ordering relative to *pre-existing* unknown regions was not
    re-courted separately (the corpus interleaves only via map-entry
    re-encodes); see item 8 in §3 for the merge/encode ordering question.
-9. **[OPEN] Deterministic map ordering tie-break.** `_upb_mapsorter`
-   (`encoder.c:594-640,857`) sorts; the exact comparison key for
-   equal-first-bytes string keys (secondary sort) is implementation detail
-   — observable in output bytes. How: oracle `encode` with
-   `kUpb_EncodeOption_Deterministic` over crafted collision keys; mirror
-   upstream `mapsorter` tests.
+9. **[RESOLVED 2026-08-20] Deterministic map ordering tie-break.**
+   `_upb_mapsorter` (map_sorter.c:28-34, 76-83) is fully pinned by the
+   encode-v1 court (3129/3129): int-keyed maps sort ascending by uintptr;
+   string-keyed maps sort with `_upb_mapsorter_cmpstr` — primary bytewise
+   DESCENDING (the negated memcmp), tie-break ascending size — and the
+   EMITTED order is the reverse of the sorted iteration (backward-built
+   buffer). The inttable comparator ignores signedness (always ascending
+   uintptr; the signed comparators in the `compar[]` table are dead code
+   for int maps). Corpus `enpm-*`/`enps-*` deterministic cases pin the
+   bytes; the reverse-emission is casefile
+   `enc-map-order-backward-buffer`.
 10. **[OPEN] Required-field false-positive semantics.** `CheckRequired`
     documents false positives on wire-incomplete-then-completed messages
     and merge (decode.h:39-52). The exact acceptance boundary needs a

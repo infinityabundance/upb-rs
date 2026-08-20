@@ -981,8 +981,11 @@ fn decode_message(
                     // (internal/encoder.c:48-68): the whole entry is
                     // re-encoded (present fields + the entry's own unknowns)
                     // and stored as an unknown field of the parent under the
-                    // map field's tag.
-                    let payload = encode_map_entry(&ent, ts, entry_idx);
+                    // map field's tag. Upstream maps an encode failure to an
+                    // OutOfMemory decode status (decode.c:523-527); the DUT
+                    // propagates the encode error (unreachable at this
+                    // surface — corpus entries are shallow).
+                    let payload = encode_map_entry(&ent, ts, entry_idx)?;
                     let mut seg = Vec::with_capacity(payload.len() + 10);
                     encode_varint(&mut seg, ((f.number as u64) << 3) | 2);
                     encode_varint(&mut seg, payload.len() as u64);
@@ -1449,115 +1452,243 @@ fn encode_scalar(out: &mut Vec<u8>, t: u8, raw: &[u8]) {
 
 /// `_upb_Encoder_AddMapEntryUnknown` payload: the exact re-encode of a parsed
 /// map entry — present fields in field-number order, then the entry's own
-/// unknown bytes in wire order (internal/encoder.c:48-68).
-fn encode_map_entry(ent: &Message, ts: &TableSet, entry_idx: usize) -> Vec<u8> {
-    let mt = ts.table(entry_idx);
-    let mut out = Vec::new();
-    for (i, f) in mt.fields.iter().enumerate() {
-        if !ent.field_present(f) {
-            continue;
-        }
-        let number = f.number as u64;
-        match f.descriptortype {
-            9 | 12 => {
-                let bytes = ent
-                    .strings
-                    .get(&(f.number as usize))
-                    .cloned()
-                    .unwrap_or_default();
-                encode_varint(&mut out, (number << 3) | 2);
-                encode_varint(&mut out, bytes.len() as u64);
-                out.extend(bytes);
-            }
-            11 => {
-                let payload = match ts.sub(entry_idx, i) {
-                    Some(s) => ent
-                        .submsgs
-                        .get(&(f.number as usize))
-                        .map(|m| encode_message(m, ts, s))
-                        .unwrap_or_default(),
-                    None => Vec::new(),
-                };
-                encode_varint(&mut out, (number << 3) | 2);
-                encode_varint(&mut out, payload.len() as u64);
-                out.extend(payload);
-            }
-            10 => unreachable!("groups cannot be map entry fields"),
-            t if is_varint_type(t) || is_fixed32_type(t) || is_fixed64_type(t) => {
-                let n = scalar_width(f);
-                let off = f.offset as usize;
-                let raw = if off + n <= ent.buf.len() {
-                    ent.buf[off..off + n].to_vec()
-                } else {
-                    vec![0; n]
-                };
-                encode_varint(&mut out, (number << 3) | wire_type_for(t));
-                encode_scalar(&mut out, t, &raw);
-            }
-            _ => unreachable!("map entry field type {}", f.descriptortype),
-        }
-    }
-    out.extend(&ent.unknown);
-    out
+/// unknown bytes in wire order. Mirrors `_upb_Encode(ent_msg, entry, 0, ...)`
+/// (internal/encoder.c:48-68): options 0 and the DEFAULT max depth, whatever
+/// the surrounding decode depth.
+fn encode_map_entry(ent: &Message, ts: &TableSet, entry_idx: usize) -> Result<Vec<u8>> {
+    encode_message_inner(ent, ts, entry_idx, reader::DEFAULT_DEPTH_LIMIT, 0)
 }
 
-/// The wire form of one stored map entry: key field (1) then value field (2),
-/// both always present (the map only stores inserted entries).
+/// The wire form of one stored map entry: `[map-tag][len][key field][value
+/// field]` — the payload is key field (1) then value field (2), both always
+/// present (the map only stores inserted entries; `encode_mapentry`,
+/// internal/encoder.c:579-592).
 fn encode_map_entry_content(
     e: &MapEntry,
     ts: &TableSet,
     table_idx: usize,
     field_idx: usize,
-) -> Vec<u8> {
+    depth: i32,
+    options: u32,
+) -> Result<Vec<u8>> {
     let entry_idx = ts.sub(table_idx, field_idx).expect("map entry linked");
     let entry_mt = ts.table(entry_idx);
     let key_f = &entry_mt.fields[0];
     let val_f = &entry_mt.fields[1];
-    let mut out = Vec::new();
-    encode_varint(&mut out, (1u64 << 3) | wire_type_for(key_f.descriptortype));
+    let mut payload = Vec::new();
+    encode_varint(
+        &mut payload,
+        (1u64 << 3) | wire_type_for(key_f.descriptortype),
+    );
     match key_f.descriptortype {
         9 | 12 => {
-            encode_varint(&mut out, e.key.len() as u64);
-            out.extend(&e.key);
+            encode_varint(&mut payload, e.key.len() as u64);
+            payload.extend(&e.key);
         }
-        _ => encode_scalar(&mut out, key_f.descriptortype, &e.key),
+        _ => encode_scalar(&mut payload, key_f.descriptortype, &e.key),
     }
-    encode_varint(&mut out, (2u64 << 3) | wire_type_for(val_f.descriptortype));
+    encode_varint(
+        &mut payload,
+        (2u64 << 3) | wire_type_for(val_f.descriptortype),
+    );
     match &e.value {
         MapValue::Scalar(bytes) => match val_f.descriptortype {
             9 | 12 => {
-                encode_varint(&mut out, bytes.len() as u64);
-                out.extend(bytes);
+                encode_varint(&mut payload, bytes.len() as u64);
+                payload.extend(bytes);
             }
-            _ => encode_scalar(&mut out, val_f.descriptortype, bytes),
+            _ => encode_scalar(&mut payload, val_f.descriptortype, bytes),
         },
         MapValue::Message(m) => {
-            let payload = ts
-                .sub(entry_idx, 1)
-                .map(|s| encode_message(m, ts, s))
-                .unwrap_or_default();
-            encode_varint(&mut out, payload.len() as u64);
-            out.extend(payload);
+            let sub_payload = match ts.sub(entry_idx, 1) {
+                Some(s) => {
+                    // `encode_scalar` Message (internal/encoder.c:434-450):
+                    // one depth level per message value; the encoder errors
+                    // when the decremented depth reaches 0 (`--e->depth == 0`,
+                    // encoder.c:441) — an off-by-one from the decoder's
+                    // `< 0` check, preserved here.
+                    if depth - 1 == 0 {
+                        return Err(KnownDecodeError::MaxDepthExceeded);
+                    }
+                    encode_message_inner(m, ts, s, depth - 1, options)?
+                }
+                None => Vec::new(),
+            };
+            encode_varint(&mut payload, sub_payload.len() as u64);
+            payload.extend(sub_payload);
         }
     }
-    out
+    let number = ts.table(table_idx).fields[field_idx].number as u64;
+    let mut out = Vec::new();
+    encode_varint(&mut out, (number << 3) | 2);
+    encode_varint(&mut out, payload.len() as u64);
+    out.extend(payload);
+    Ok(out)
 }
 
-/// `_upb_Encode` for the supported surface: present fields in mini-table
-/// (field-number) order, then the message's unknown bytes in wire order.
-/// Presence follows `field_present`: hasbit fields only when set, oneof
-/// members only when their case matches, presence-less (proto3-singular)
-/// fields always (stored value, 0 when never written).
-fn encode_message(msg: &Message, ts: &TableSet, table_idx: usize) -> Vec<u8> {
+/// `encode_shouldencode` (internal/encoder.c:642-678): presence semantics for
+/// encode. Hasbit fields encode iff their bit is set; oneof members iff their
+/// case matches; presence-less fields (proto3-singular, map, array) encode iff
+/// the stored value is non-zero / the collection non-empty.
+///
+/// Note this differs from `Message::field_present` (dump semantics), which
+/// renders presence-less fields unconditionally. In particular a MAP field
+/// built from a singular message descriptor keeps a hasbit that the decoder
+/// never sets (`_upb_Decoder_DecodeToMap` sets no presence), so such maps are
+/// skipped on encode exactly like upstream — while protoc-generated map fields
+/// (repeated message + link) are presence-less and encode normally.
+fn encode_shouldencode(msg: &Message, f: &MiniTableField) -> bool {
+    let num = f.number as usize;
+    if f.presence > 0 {
+        msg.hasbit_set(f.presence as u16)
+    } else if f.is_in_oneof() {
+        msg.oneof_case((!f.presence) as u16) == f.number
+    } else {
+        match f.mode_class() {
+            FieldMode::Map => msg.maps.get(&num).is_some_and(|m| !m.is_empty()),
+            FieldMode::Array => match f.descriptortype {
+                11 | 10 => msg.submsg_arrays.get(&num).is_some_and(|a| !a.is_empty()),
+                _ => msg.arrays.get(&num).is_some_and(|a| !a.is_empty()),
+            },
+            FieldMode::Scalar => match f.descriptortype {
+                9 | 12 => msg.strings.get(&num).is_some_and(|s| !s.is_empty()),
+                11 | 10 => msg.submsgs.contains_key(&num),
+                t if is_varint_type(t) || is_fixed32_type(t) || is_fixed64_type(t) => {
+                    let n = scalar_width(f);
+                    let off = f.offset as usize;
+                    msg.buf
+                        .get(off..off + n)
+                        .is_some_and(|b| b.iter().any(|&x| x != 0))
+                }
+                _ => true,
+            },
+        }
+    }
+}
+
+/// `_upb_mapsorter_pushmap` ordering (message/map_sorter.c:28-34, 76-83,
+/// 125-155) for deterministic encode: int-table maps sort by ascending
+/// uintptr key; string-keyed maps sort with `_upb_mapsorter_cmpstr` — primary
+/// bytewise DESCENDING (the negated memcmp), tie-break ascending size. The
+/// string comparator is inverted relative to the protobuf spec's ascending
+/// expectation; preserved for oracle parity (casefile enc-map-sort-string).
+fn sort_map_entries(entries: &mut [MapEntry], key_type: u8) {
+    if key_type == 9 || key_type == 12 {
+        entries.sort_by(|a, b| {
+            let ka = &a.key;
+            let kb = &b.key;
+            let common = ka.len().min(kb.len());
+            match ka[..common].cmp(&kb[..common]) {
+                std::cmp::Ordering::Equal => ka.len().cmp(&kb.len()),
+                o => o.reverse(),
+            }
+        });
+    } else {
+        entries.sort_by_key(|e| match e.key.len() {
+            1 => e.key[0] as u64,
+            4 => u32::from_le_bytes(e.key[..4].try_into().expect("4-byte map key")) as u64,
+            8 => u64::from_le_bytes(e.key[..8].try_into().expect("8-byte map key")),
+            n => panic!("unexpected map key width {n}"),
+        });
+    }
+}
+
+/// `kUpb_EncodeOption_Deterministic` (wire/encode.h:36).
+pub const ENCODE_OPTION_DETERMINISTIC: u32 = 1;
+/// `kUpb_EncodeOption_SkipUnknown` (wire/encode.h:39).
+pub const ENCODE_OPTION_SKIP_UNKNOWN: u32 = 2;
+
+/// Decode + re-encode (`upb_Decode` then `upb_Encode`): the DUT side of the
+/// oracle's `encode` op. `options` bits and `max_depth` mirror
+/// upb_Encode/upb_EncodeOptions_MaxDepth (0 -> default 100).
+pub fn encode_submsg(
+    mds: &[&[u8]],
+    links: &[&[usize]],
+    input: &[u8],
+    max_depth: u32,
+    options: u32,
+) -> Result<Vec<u8>> {
+    let ts = TableSet::from_pool(mds, links)?;
+    reject_deferred(&ts)?;
+    let depth = effective_depth(max_depth);
+    let mut msg = Message::new(ts.main().size as usize);
+    let mut stream = EpsCopyStream::init(input);
+    let mut ptr = 0usize;
+    decode_message(&ts, 0, &mut msg, &mut stream, &mut ptr, depth, input, None)?;
+    encode_message_inner(&msg, &ts, 0, depth, options)
+}
+
+/// Decode + re-encode for a single-table schema (`decode_known` + encode).
+pub fn encode_known(
+    descriptor: &[u8],
+    input: &[u8],
+    max_depth: u32,
+    options: u32,
+) -> Result<Vec<u8>> {
+    let ts = TableSet::from_single(descriptor)?;
+    reject_deferred(&ts)?;
+    let depth = effective_depth(max_depth);
+    let mut msg = Message::new(ts.main().size as usize);
+    let mut stream = EpsCopyStream::init(input);
+    let mut ptr = 0usize;
+    decode_message(&ts, 0, &mut msg, &mut stream, &mut ptr, depth, input, None)?;
+    encode_message_inner(&msg, &ts, 0, depth, options)
+}
+
+/// `_upb_Encode` for the supported surface: unknown bytes first (dropped under
+/// SkipUnknown), then present fields in field-number order, mirroring the
+/// net output of the backward-buffer encoder (internal/encoder.c:764-816).
+/// `depth` is the encode recursion budget (`--e->depth == 0` errors,
+/// encoder.c:426, 441).
+pub fn encode_message(
+    msg: &Message,
+    ts: &TableSet,
+    table_idx: usize,
+    max_depth: u32,
+    options: u32,
+) -> Result<Vec<u8>> {
+    encode_message_inner(msg, ts, table_idx, effective_depth(max_depth), options)
+}
+
+fn encode_message_inner(
+    msg: &Message,
+    ts: &TableSet,
+    table_idx: usize,
+    depth: i32,
+    options: u32,
+) -> Result<Vec<u8>> {
     let mt = ts.table(table_idx);
     let mut out = Vec::new();
     for (i, f) in mt.fields.iter().enumerate() {
+        if !encode_shouldencode(msg, f) {
+            continue;
+        }
         let number = f.number as u64;
         match f.mode_class() {
             FieldMode::Map => {
+                // `encode_map` (internal/encoder.c:594-640): deterministic
+                // mode sorts entries via _upb_mapsorter; otherwise the map
+                // table's iteration order (the model keeps insertion order;
+                // the court compares non-deterministic map output
+                // semantically — NONDETERMINISM.md §map-order).
                 if let Some(entries) = msg.maps.get(&(f.number as usize)) {
-                    for e in entries {
-                        out.extend(encode_map_entry_content(e, ts, table_idx, i));
+                    let entry_idx = ts
+                        .sub(table_idx, i)
+                        .expect("Map mode implies a linked map-entry table");
+                    let key_type = ts.table(entry_idx).fields[0].descriptortype;
+                    let mut sorted: Vec<MapEntry> = entries.clone();
+                    if options & ENCODE_OPTION_DETERMINISTIC != 0 {
+                        sort_map_entries(&mut sorted, key_type);
+                    }
+                    // The encoder builds the buffer backwards, so the output
+                    // is the REVERSE of the iteration order: upstream iterates
+                    // the mapsorter's sorted order forward and the emitted
+                    // bytes come out reversed (encoder.c:594-640). Mirror that
+                    // by emitting the sorted entries in reverse.
+                    for e in sorted.iter().rev() {
+                        out.extend(encode_map_entry_content(
+                            e, ts, table_idx, i, depth, options,
+                        )?);
                     }
                 }
             }
@@ -1575,7 +1706,18 @@ fn encode_message(msg: &Message, ts: &TableSet, table_idx: usize) -> Vec<u8> {
                     if let Some(elems) = msg.submsg_arrays.get(&(f.number as usize)) {
                         let sub = ts.sub(table_idx, i);
                         for e in elems {
-                            let payload = sub.map(|s| encode_message(e, ts, s)).unwrap_or_default();
+                            // `encode_array` Message (encoder.c:552-566): one
+                            // depth level per element; `--e->depth == 0`
+                            // errors (encoder.c:556).
+                            let payload = match sub {
+                                Some(s) => {
+                                    if depth - 1 == 0 {
+                                        return Err(KnownDecodeError::MaxDepthExceeded);
+                                    }
+                                    encode_message_inner(e, ts, s, depth - 1, options)?
+                                }
+                                None => Vec::new(),
+                            };
                             encode_varint(&mut out, (number << 3) | 2);
                             encode_varint(&mut out, payload.len() as u64);
                             out.extend(payload);
@@ -1583,11 +1725,22 @@ fn encode_message(msg: &Message, ts: &TableSet, table_idx: usize) -> Vec<u8> {
                     }
                 }
                 10 => {
-                    // Repeated group: bracketed by the start/end group tags.
+                    // Repeated group: bracketed by the start/end group tags
+                    // (encoder.c:535-551).
                     if let Some(elems) = msg.submsg_arrays.get(&(f.number as usize)) {
                         let sub = ts.sub(table_idx, i);
                         for e in elems {
-                            let body = sub.map(|s| encode_message(e, ts, s)).unwrap_or_default();
+                            let body = match sub {
+                                Some(s) => {
+                                    // `encode_array` Group (encoder.c:535-551):
+                                    // `--e->depth == 0` errors (encoder.c:539).
+                                    if depth - 1 == 0 {
+                                        return Err(KnownDecodeError::MaxDepthExceeded);
+                                    }
+                                    encode_message_inner(e, ts, s, depth - 1, options)?
+                                }
+                                None => Vec::new(),
+                            };
                             encode_varint(&mut out, (number << 3) | 3);
                             out.extend(body);
                             encode_varint(&mut out, (number << 3) | 4);
@@ -1596,6 +1749,10 @@ fn encode_message(msg: &Message, ts: &TableSet, table_idx: usize) -> Vec<u8> {
                 }
                 t if is_varint_type(t) => {
                     if let Some(elems) = msg.arrays.get(&(f.number as usize)) {
+                        // Packed only when the field is flagged packed
+                        // (`upb_MiniTableField_IsPacked`): a packed wire input
+                        // for an unpacked-flagged field re-encodes unpacked
+                        // (encode_array, encoder.c:460).
                         if f.is_packed() {
                             let mut body = Vec::new();
                             for e in elems {
@@ -1632,66 +1789,81 @@ fn encode_message(msg: &Message, ts: &TableSet, table_idx: usize) -> Vec<u8> {
                 }
                 _ => {}
             },
-            FieldMode::Scalar => {
-                if !msg.field_present(f) {
-                    continue;
+            FieldMode::Scalar => match f.descriptortype {
+                9 | 12 => {
+                    let bytes = msg
+                        .strings
+                        .get(&(f.number as usize))
+                        .cloned()
+                        .unwrap_or_default();
+                    encode_varint(&mut out, (number << 3) | 2);
+                    encode_varint(&mut out, bytes.len() as u64);
+                    out.extend(bytes);
                 }
-                match f.descriptortype {
-                    9 | 12 => {
-                        let bytes = msg
-                            .strings
-                            .get(&(f.number as usize))
-                            .cloned()
-                            .unwrap_or_default();
-                        encode_varint(&mut out, (number << 3) | 2);
-                        encode_varint(&mut out, bytes.len() as u64);
-                        out.extend(bytes);
-                    }
-                    11 => {
-                        let payload = match ts.sub(table_idx, i) {
-                            Some(s) => msg
-                                .submsgs
+                11 => {
+                    let payload = match ts.sub(table_idx, i) {
+                        Some(s) => {
+                            // `encode_scalar` Message (encoder.c:434-450):
+                            // `--e->depth == 0` errors (encoder.c:441).
+                            if depth - 1 == 0 {
+                                return Err(KnownDecodeError::MaxDepthExceeded);
+                            }
+                            msg.submsgs
                                 .get(&(f.number as usize))
-                                .map(|m| encode_message(m, ts, s))
-                                .unwrap_or_default(),
-                            None => Vec::new(),
-                        };
-                        encode_varint(&mut out, (number << 3) | 2);
-                        encode_varint(&mut out, payload.len() as u64);
-                        out.extend(payload);
-                    }
-                    10 => {
-                        // Singular group: start tag, body, end tag.
-                        let body = match ts.sub(table_idx, i) {
-                            Some(s) => msg
-                                .submsgs
-                                .get(&(f.number as usize))
-                                .map(|m| encode_message(m, ts, s))
-                                .unwrap_or_default(),
-                            None => Vec::new(),
-                        };
-                        encode_varint(&mut out, (number << 3) | 3);
-                        out.extend(body);
-                        encode_varint(&mut out, (number << 3) | 4);
-                    }
-                    t if is_varint_type(t) || is_fixed32_type(t) || is_fixed64_type(t) => {
-                        let n = scalar_width(f);
-                        let off = f.offset as usize;
-                        let raw = if off + n <= msg.buf.len() {
-                            msg.buf[off..off + n].to_vec()
-                        } else {
-                            vec![0; n]
-                        };
-                        encode_varint(&mut out, (number << 3) | wire_type_for(t));
-                        encode_scalar(&mut out, t, &raw);
-                    }
-                    _ => {}
+                                .map(|m| encode_message_inner(m, ts, s, depth - 1, options))
+                                .transpose()?
+                                .unwrap_or_default()
+                        }
+                        None => Vec::new(),
+                    };
+                    encode_varint(&mut out, (number << 3) | 2);
+                    encode_varint(&mut out, payload.len() as u64);
+                    out.extend(payload);
                 }
-            }
+                10 => {
+                    // Singular group: start tag, body, end tag (encoder.c:419-433).
+                    let body = match ts.sub(table_idx, i) {
+                        Some(s) => {
+                            // `encode_scalar` Group (encoder.c:419-433):
+                            // `--e->depth == 0` errors (encoder.c:426).
+                            if depth - 1 == 0 {
+                                return Err(KnownDecodeError::MaxDepthExceeded);
+                            }
+                            msg.submsgs
+                                .get(&(f.number as usize))
+                                .map(|m| encode_message_inner(m, ts, s, depth - 1, options))
+                                .transpose()?
+                                .unwrap_or_default()
+                        }
+                        None => Vec::new(),
+                    };
+                    encode_varint(&mut out, (number << 3) | 3);
+                    out.extend(body);
+                    encode_varint(&mut out, (number << 3) | 4);
+                }
+                t if is_varint_type(t) || is_fixed32_type(t) || is_fixed64_type(t) => {
+                    let n = scalar_width(f);
+                    let off = f.offset as usize;
+                    let raw = if off + n <= msg.buf.len() {
+                        msg.buf[off..off + n].to_vec()
+                    } else {
+                        vec![0; n]
+                    };
+                    encode_varint(&mut out, (number << 3) | wire_type_for(t));
+                    encode_scalar(&mut out, t, &raw);
+                }
+                _ => {}
+            },
         }
     }
-    out.extend(&msg.unknown);
-    out
+    // Unknown fields are emitted after the known fields in the forward output
+    // (they are written first into the backward-built buffer and therefore
+    // land at the high addresses; encoder.c:776-798). SkipUnknown drops them
+    // (encode.h:38-39).
+    if options & ENCODE_OPTION_SKIP_UNKNOWN == 0 {
+        out.extend(&msg.unknown);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -2492,5 +2664,139 @@ mod tests {
             100,
         );
         assert!(matches!(e, Err(KnownDecodeError::Unsupported(_))));
+    }
+
+    // ---------------------------------------------------------------------
+    // Encoder courts (unit-level regression pins; the differential evidence
+    // is the encode-v1 court, 3129/3129 sealed).
+    // ---------------------------------------------------------------------
+
+    /// A nested-message payload builder (the corpus `recursive_payload`
+    /// equivalent): `n` nested delimited sub-messages.
+    fn nested(n: usize) -> Vec<u8> {
+        let mut p = vec![0x0Au8, 0x00];
+        for _ in 1..n {
+            let mut head = vec![0x0Au8];
+            encode_varint(&mut head, p.len() as u64);
+            let mut n = head;
+            n.extend_from_slice(&p);
+            p = n;
+        }
+        p
+    }
+
+    /// Basic decode -> re-encode round trip (sub-message, scalars, unknowns).
+    #[test]
+    fn encode_roundtrip_submsg() {
+        // A { B b = 1; } B { uint32 x = 1; } ($3 + $)).
+        let input = [0x0A, 0x02, 0x08, 0x01];
+        let bytes =
+            encode_submsg(&[&[0x24, 0x33], &[0x24, 0x29]], &[&[1], &[]], &input, 0, 0).unwrap();
+        assert_eq!(bytes, input);
+    }
+
+    /// Map-field presence asymmetry on encode: a map field built from a
+    /// singular message descriptor keeps a hasbit the decoder never sets, so
+    /// the map is SKIPPED on encode (`encode_shouldencode`, encoder.c:642-678;
+    /// `_upb_Decoder_DecodeToMap` sets no presence, decode.c:474-535). The
+    /// protoc-shape map field (repeated message) is presence-less and encodes.
+    #[test]
+    fn encode_map_presence_asymmetry() {
+        // Singular-17 map field ($3 + entry): hasbit unset -> empty output.
+        let bytes = encode_submsg(
+            &[&[0x24, 0x33], &[0x25, 0x29, 0x28]],
+            &[&[1], &[]],
+            &[0x0A, 0x04, 0x08, 0x05, 0x10, 0x07],
+            0,
+            0,
+        )
+        .unwrap();
+        assert!(bytes.is_empty());
+        // Protoc-shape map field ($G + entry): presence-less -> encodes.
+        let bytes = encode_submsg(
+            &[&[0x24, 0x47], &[0x25, 0x29, 0x28]],
+            &[&[1], &[]],
+            &[0x0A, 0x04, 0x08, 0x05, 0x10, 0x07],
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(bytes, [0x0A, 0x04, 0x08, 0x05, 0x10, 0x07]);
+    }
+
+    /// Deterministic map encoding: the mapsorter sorts ascending for int keys
+    /// but the emitted bytes are the REVERSE of the sorted iteration (the
+    /// backward-built buffer; encoder.c:594-640), so wire order {1},{5}
+    /// re-encodes as {5},{1} under Deterministic.
+    #[test]
+    fn encode_deterministic_map_reverse_sort() {
+        let input = [
+            0x0A, 0x04, 0x08, 0x01, 0x10, 0x02, 0x0A, 0x04, 0x08, 0x05, 0x10, 0x07,
+        ];
+        let bytes = encode_submsg(
+            &[&[0x24, 0x47], &[0x25, 0x29, 0x28]],
+            &[&[1], &[]],
+            &input,
+            0,
+            ENCODE_OPTION_DETERMINISTIC,
+        )
+        .unwrap();
+        assert_eq!(
+            bytes,
+            [0x0A, 0x04, 0x08, 0x05, 0x10, 0x07, 0x0A, 0x04, 0x08, 0x01, 0x10, 0x02]
+        );
+    }
+
+    /// Encode depth asymmetry: the decoder errors at `--depth < 0` (N nested
+    /// levels decode at max depth N) but the encoder errors at `--depth == 0`
+    /// (N nested levels fail to encode at max depth N) — encoder.c:426,441
+    /// vs decode.c:196.
+    #[test]
+    fn encode_depth_off_by_one() {
+        let mds = [&[0x24, 0x33][..]];
+        let links = [&[0usize][..]];
+        // 100 nested levels: decodes at depth 100, fails to re-encode.
+        let p100 = nested(100);
+        assert!(decode_submsg(&mds, &links, &p100, 100).is_ok());
+        assert!(matches!(
+            encode_submsg(&mds, &links, &p100, 100, 0),
+            Err(KnownDecodeError::MaxDepthExceeded)
+        ));
+        // 99 nested levels: round-trips at depth 100.
+        let p99 = nested(99);
+        assert_eq!(encode_submsg(&mds, &links, &p99, 100, 0).unwrap(), p99);
+    }
+
+    /// The packed flag on the descriptor selects the encoded form: unpacked
+    /// wire input for a packed-flagged repeated field re-encodes PACKED
+    /// (encode_array, encoder.c:457-577).
+    #[test]
+    fn encode_packed_flag_controls_form() {
+        use upb_rs_mini_table::base92;
+        // Message with MSG_MOD_DEFAULT_IS_PACKED (1 << 1 = 2) and one
+        // repeated UInt32.
+        let mut desc = vec![b'$'];
+        base92::encode_varint(&mut desc, 2, b'L', b'[');
+        desc.push(base92::to_base92(7 + 20));
+        // Unpacked wire input (three varint elements).
+        let bytes = encode_known(&desc, &[0x08, 0x01, 0x08, 0x02, 0x08, 0x03], 0, 0).unwrap();
+        assert_eq!(bytes, [0x0A, 0x03, 0x01, 0x02, 0x03]);
+    }
+
+    /// SkipUnknown drops the message's unknown bytes from the output
+    /// (encode.h:38-39).
+    #[test]
+    fn encode_skip_unknown() {
+        let mds = [&[0x24, 0x29][..]]; // $) = A { uint32 x = 1; }
+        let links = [&[][..]];
+        let input = [0x08, 0x01, 0x15, 0x00, 0x00, 0x00, 0x00]; // x=1 + fixed32 unknown
+        assert_eq!(
+            encode_submsg(&mds, &links, &input, 0, 0).unwrap(),
+            [0x08, 0x01, 0x15, 0x00, 0x00, 0x00, 0x00]
+        );
+        assert_eq!(
+            encode_submsg(&mds, &links, &input, 0, ENCODE_OPTION_SKIP_UNKNOWN).unwrap(),
+            [0x08, 0x01]
+        );
     }
 }

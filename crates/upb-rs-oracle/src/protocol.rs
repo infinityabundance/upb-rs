@@ -243,6 +243,10 @@ pub struct OracleRequest {
     /// order).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub links: Option<Vec<Vec<u64>>>,
+    /// encode: the upb_Encode options word (Deterministic = 1,
+    /// SkipUnknown = 2; encode.h:29-43).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub options: Option<u64>,
     /// arena_trace: the arena configuration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub arena: Option<ArenaCfg>,
@@ -284,6 +288,7 @@ impl OracleRequest {
             md: None,
             mds: None,
             links: None,
+            options: None,
             arena: None,
             ops: None,
             gen_ops: None,
@@ -307,6 +312,7 @@ impl OracleRequest {
             md: None,
             mds: None,
             links: None,
+            options: None,
             arena: None,
             ops: None,
             gen_ops: None,
@@ -330,6 +336,7 @@ impl OracleRequest {
             md: None,
             mds: None,
             links: None,
+            options: None,
             arena: None,
             ops: None,
             gen_ops: None,
@@ -353,6 +360,7 @@ impl OracleRequest {
             md: None,
             mds: None,
             links: None,
+            options: None,
             arena: None,
             ops: None,
             gen_ops: None,
@@ -376,6 +384,7 @@ impl OracleRequest {
             md: Some(hex_encode(md)),
             mds: None,
             links: None,
+            options: None,
             arena: None,
             ops: None,
             gen_ops: None,
@@ -405,6 +414,41 @@ impl OracleRequest {
             md: None,
             mds: Some(mds.iter().map(|m| hex_encode(m)).collect()),
             links: Some(links.to_vec()),
+            options: None,
+            arena: None,
+            ops: None,
+            gen_ops: None,
+            a: None,
+            a_ops: None,
+            b: None,
+            b_ops: None,
+            post_ops: None,
+            free: None,
+        }
+    }
+
+    /// encode: decode the pool payload (upb_Decode, max depth `depth`) then
+    /// re-encode with the real upb_Encode under `options` and max depth
+    /// `depth`. `depth == 0` -> the default 100 for both.
+    pub fn encode(
+        id: u64,
+        mds: &[Vec<u8>],
+        links: &[Vec<u64>],
+        payload: &[u8],
+        depth: u32,
+        options: u32,
+    ) -> OracleRequest {
+        OracleRequest {
+            v: 1,
+            id,
+            op: "encode".to_string(),
+            hex: hex_encode(payload),
+            tag: None,
+            depth: Some(depth as u64),
+            md: None,
+            mds: Some(mds.iter().map(|m| hex_encode(m)).collect()),
+            links: Some(links.to_vec()),
+            options: Some(options as u64),
             arena: None,
             ops: None,
             gen_ops: None,
@@ -428,6 +472,7 @@ impl OracleRequest {
             md: None,
             mds: None,
             links: None,
+            options: None,
             arena: None,
             ops: None,
             gen_ops: None,
@@ -456,6 +501,7 @@ impl OracleRequest {
             md: None,
             mds: None,
             links: None,
+            options: None,
             arena: Some(arena),
             ops: Some(ops.to_vec()),
             gen_ops: None,
@@ -486,6 +532,7 @@ impl OracleRequest {
             md: None,
             mds: None,
             links: None,
+            options: None,
             arena: None,
             ops: None,
             gen_ops: None,
@@ -510,6 +557,7 @@ impl OracleRequest {
             md: None,
             mds: None,
             links: None,
+            options: None,
             arena: Some(arena),
             ops: None,
             gen_ops: Some(ops.to_vec()),

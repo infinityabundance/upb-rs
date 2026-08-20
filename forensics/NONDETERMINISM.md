@@ -129,6 +129,14 @@ and compensates:
   `upb/message/map_sorter.c:157-184`).
 - Maps: deterministic mode sorts entries by key type via `_upb_mapsorter_pushmap`
   (encoder.c:602-614); otherwise hash order (encoder.c:615-637).
+  **Sealed detail (encode-v1 court): the emitted entry order is the REVERSE of
+  the sorted iteration order** — the sorted map is iterated forward while the
+  buffer is built backwards (encoder.c:594-640), so the output bytes come out
+  reversed. Int-keyed maps sort ascending (`_upb_mapsorter_intkeys`,
+  map_sorter.c:28-34); string-keyed maps sort with `_upb_mapsorter_cmpstr`
+  (map_sorter.c:76-83): primary bytewise DESCENDING (the negated memcmp),
+  tie-break ascending size. Both orderings are pinned byte-exactly by the
+  corpus (`enpm-*`/`enps-*` deterministic cases).
 - Map entry payload: **value first, then key** (encoder.c:579-592) — the
   canonical protobuf map-entry encoding.
 - Length limit: a delimited length > INT32_MAX fails encode with

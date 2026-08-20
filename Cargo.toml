@@ -25,6 +25,7 @@ members = [
     "courts/mini-table-inspect",
     "courts/decode-known",
     "courts/decode-submsg",
+    "courts/encode",
     "courts/arena",
     "courts/collections",
 ]

@@ -1,0 +1,12 @@
+[package]
+name = "court-encode"
+version = "0.1.0"
+edition = "2021"
+description = "Differential court: decode-then-re-encode (upb_Decode + upb_Encode) with options 0/Deterministic/SkipUnknown, oracle (real upb_Encode over a pool of linked mini tables) vs DUT (upb-rs-wire encode_submsg/encode_known)"
+
+[dependencies]
+upb-rs-casefile = { version = "0.1.0", path = "../../crates/upb-rs-casefile" }
+upb-rs-oracle = { version = "0.1.5", path = "../../crates/upb-rs-oracle" }
+upb-rs-wire = { version = "0.1.6", path = "../../crates/upb-rs-wire" }
+serde = { workspace = true }
+serde_json = { workspace = true }

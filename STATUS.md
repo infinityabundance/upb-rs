@@ -20,7 +20,7 @@ happy-path tests.
 | wire decode: maps         | PARITY-SEALED | courts/decode-submsg (259 cases, 0 residuals; map fields, last-wins, unknown-entry re-encode, message values, nested maps) |
 | wire decode: groups       | PARITY-SEALED | courts/decode-submsg (259 cases, 0 residuals; singular/merge, repeated, nested, oneof, unlinked, depth, malformed EndGroup) |
 | wire decode: closed enums | PARITY-SEALED | courts/decode-submsg (259 cases, 0 residuals; valid/invalid/overlong/negative values, packed re-encode, map-value enums, SetSubEnum include-0 rule) |
-| wire encode               | UNMAPPED      | —                                                     |
+| wire encode               | PARITY-SEALED | courts/encode (3129 cases, 0 residuals; 3127 byte-exact + 2 classified map-order; presence semantics, deterministic reversed sort, SkipUnknown, depth off-by-one) |
 | mini tables               | ORACLE-TESTED | courts/mini-table-inspect (701 cases, 0 residuals)  |
 | mini descriptors          | ORACLE-TESTED | courts/mini-table-inspect (701 cases, 0 residuals)  |
 | arena / memory            | PARITY-SEALED | courts/arena (61 cases, 0 residuals; forensics/MEMORY_MODEL.md) |
@@ -38,17 +38,17 @@ happy-path tests.
 
 ## Current phase
 
-Phase 0 (archaeology + court infrastructure) is established; seven courts are
+Phase 0 (archaeology + court infrastructure) is established; eight courts are
 live and sealed at 0 residuals over the charter boundary-length corpus:
 wire-primitives (1537), decode-empty (338), mini-table-inspect (701),
-decode-known (517), decode-submsg (259), arena (61), and collections (52).
+decode-known (517), decode-submsg (259), encode (3129), arena (61), and
+collections (52).
 Phase 1 (core representation + arena) is sealed: the ArenaPool, Array, and
 Map models are PARITY-SEALED against the real upb_Arena / upb_Array /
-upb_Map. Phase 2 (binary wire parity) is underway: map fields, group fields,
-and closed-enum fields decode are sealed inside the decode-submsg court
-(184 -> 259 cases; last-wins inserts, empty entries, string keys/values,
-message values, nested maps, unknown-inside-entry re-encode via
-AddMapEntryUnknown, group merge/bounds, closed-enum raw-span preservation and
-packed re-encode, negative values, the SetSubEnum include-0 rule). Next
-milestones per forensics/OPEN_QUESTIONS.md: the encoder court (wire.encode),
-then merge/clear/clone and unknown handling, then deterministic mode.
+upb_Map. Phase 2 (binary wire parity) is underway: the decoder surface
+(maps, groups, closed enums) and the encoder surface (options 0 /
+Deterministic / SkipUnknown, presence semantics, deterministic map
+ordering, depth boundaries) are sealed; next milestones per
+forensics/OPEN_QUESTIONS.md: merge/clear/clone semantics and unknown
+handling, then deterministic-mode cross-checks, then Phase 3 mini
+descriptors at scale.

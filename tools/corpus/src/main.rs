@@ -44,6 +44,9 @@ struct Case {
     /// decode_submsg: per-table sub-slot -> table index.
     #[serde(skip_serializing_if = "Option::is_none")]
     links: Option<Vec<Vec<u64>>>,
+    /// encode: the upb_Encode options word (Deterministic = 1, SkipUnknown = 2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    options: Option<u64>,
     kind: String,
     seed: u64,
 }
@@ -109,6 +112,7 @@ impl CaseSet {
             md: None,
             mds: None,
             links: None,
+            options: None,
             kind: kind.to_string(),
             seed: self.seed,
         });
@@ -123,6 +127,7 @@ impl CaseSet {
             md: Some(hex(md)),
             mds: None,
             links: None,
+            options: None,
             kind: kind.to_string(),
             seed: self.seed,
         });
@@ -138,6 +143,7 @@ impl CaseSet {
             md: None,
             mds: Some(mds.iter().map(|m| hex(m)).collect()),
             links: Some(links.to_vec()),
+            options: None,
             kind: kind.to_string(),
             seed: self.seed,
         });
@@ -160,6 +166,32 @@ impl CaseSet {
             md: None,
             mds: Some(mds.iter().map(|m| hex(m)).collect()),
             links: Some(links.to_vec()),
+            options: None,
+            kind: kind.to_string(),
+            seed: self.seed,
+        });
+    }
+
+    /// encode case: decode the pool payload and re-encode under `options` and
+    /// `depth` (the oracle op `encode`).
+    fn push_encode(
+        &mut self,
+        mds: &[Vec<u8>],
+        links: &[Vec<u64>],
+        bytes: &[u8],
+        depth: u64,
+        options: u64,
+        kind: &str,
+    ) {
+        self.cases.push(Case {
+            op: "encode".to_string(),
+            hex: hex(bytes),
+            tag: None,
+            depth: Some(depth),
+            md: None,
+            mds: Some(mds.iter().map(|m| hex(m)).collect()),
+            links: Some(links.to_vec()),
+            options: Some(options),
             kind: kind.to_string(),
             seed: self.seed,
         });
@@ -174,6 +206,7 @@ impl CaseSet {
             md: None,
             mds: None,
             links: None,
+            options: None,
             kind: kind.to_string(),
             seed: self.seed,
         });
@@ -1235,38 +1268,39 @@ fn recursive_payload(depth: usize) -> Vec<u8> {
     p
 }
 
+/// Mini descriptor builders shared by the sub-message and encode corpus
+/// generators (tooling only; mirrors mini_descriptor/internal/encode.c). The
+/// encoded types are the kUpb_EncodedType values (wire_constants.h:16-38).
+fn md_fields(fields: &[(u32, usize)]) -> Vec<u8> {
+    let mut e = mdgen::MessageEncoder::new(0);
+    for &(n, t) in fields {
+        e.field(n, t, 0);
+    }
+    e.finish()
+}
+fn md_oneof(fields: &[(u32, usize)]) -> Vec<u8> {
+    let mut e = mdgen::MessageEncoder::new(0);
+    for &(n, t) in fields {
+        e.field(n, t, 0);
+    }
+    e.start_oneofs();
+    for (i, &(n, _)) in fields.iter().enumerate() {
+        e.oneof_field(n, i == 0);
+    }
+    e.finish()
+}
+/// A `!`-versioned closed-enum descriptor for an ascending value list.
+fn enum_descriptor(values: &[u32]) -> Vec<u8> {
+    let mut e = mdgen::EnumEncoder::new();
+    for &v in values {
+        e.value(v);
+    }
+    e.finish()
+}
+
 fn gen_decode_submsg_corpus(set: &mut CaseSet) {
     use mdgen::*;
 
-    // Descriptor builders. Every generated descriptor is pinned against the
-    // oracle's mini_table_inspect in the court's unit tests; the encoded
-    // types below are the kUpb_EncodedType values (wire_constants.h:16-38).
-    fn md_fields(fields: &[(u32, usize)]) -> Vec<u8> {
-        let mut e = MessageEncoder::new(0);
-        for &(n, t) in fields {
-            e.field(n, t, 0);
-        }
-        e.finish()
-    }
-    fn md_oneof(fields: &[(u32, usize)]) -> Vec<u8> {
-        let mut e = MessageEncoder::new(0);
-        for &(n, t) in fields {
-            e.field(n, t, 0);
-        }
-        e.start_oneofs();
-        for (i, &(n, _)) in fields.iter().enumerate() {
-            e.oneof_field(n, i == 0);
-        }
-        e.finish()
-    }
-    /// A `!`-versioned closed-enum descriptor for an ascending value list.
-    fn enum_descriptor(values: &[u32]) -> Vec<u8> {
-        let mut e = EnumEncoder::new();
-        for &v in values {
-            e.value(v);
-        }
-        e.finish()
-    }
     fn push_truncations(
         set: &mut CaseSet,
         mds: &[Vec<u8>],
@@ -2296,6 +2330,286 @@ fn gen_decode_submsg_corpus(set: &mut CaseSet) {
     // `closed_enum_unlinked_rejected`.
 }
 
+/// Encode-specific cases (oracle op `encode`): decode the payload over the
+/// pool, then re-encode with the real upb_Encode under the given options.
+/// The court derives option variants (0, Deterministic, SkipUnknown,
+/// Deterministic|SkipUnknown) from every decode_submsg/decode_known case;
+/// this generator adds the surfaces decode-only cases cannot reach:
+///
+/// * protoc-shape map fields (a REPEATED message field linked to the entry):
+///   presence-less, so the map actually re-encodes — unlike the corpus's
+///   singular-17 map shape, whose hasbit is never set by the decoder and is
+///   therefore skipped on encode (QUIRKS.md §16; encode_shouldencode,
+///   encoder.c:642-678);
+/// * deterministic map ordering (int keys ascending; string keys bytewise
+///   descending with ascending-size tie-break — map_sorter.c:28-34, 76-83);
+/// * encode recursion depth boundaries (the encoder errors at
+///   `--e->depth == 0`, one level earlier than the decoder's `< 0`);
+/// * flagged-packed repeated fields in pool schemas (the packed flag controls
+///   the encoded form).
+fn gen_encode_corpus(set: &mut CaseSet) {
+    use mdgen::*;
+
+    // Protoc-shape maps: A { map<uint32,int32> m = 1; } with the map field a
+    // repeated message field (RepeatedBase + 17).
+    {
+        let mds = vec![md_fields(&[(1, 17 + REPEATED_BASE)]), map_descriptor(7, 6)];
+        let links = vec![vec![1], vec![]];
+        set.push_encode(&mds, &links, &[], 0, 0, "enpm-empty");
+        set.push_encode(
+            &mds,
+            &links,
+            &[0x0A, 0x04, 0x08, 0x05, 0x10, 0x07],
+            0,
+            0,
+            "enpm-one",
+        );
+        set.push_encode(
+            &mds,
+            &links,
+            &[0x0A, 0x04, 0x08, 0x05, 0x10, 0x07],
+            0,
+            1,
+            "enpm-one-det",
+        );
+        // Two entries in wire order 1 then 5: deterministic sorts ascending
+        // and emits the REVERSED sorted order, so the output is 5 then 1
+        // (backward-built buffer, encoder.c:594-640).
+        set.push_encode(
+            &mds,
+            &links,
+            &[
+                0x0A, 0x04, 0x08, 0x01, 0x10, 0x02, 0x0A, 0x04, 0x08, 0x05, 0x10, 0x07,
+            ],
+            0,
+            1,
+            "enpm-two-det-asc",
+        );
+        // SkipUnknown has no unknowns here; deterministic|skip.
+        set.push_encode(
+            &mds,
+            &links,
+            &[
+                0x0A, 0x04, 0x08, 0x01, 0x10, 0x02, 0x0A, 0x04, 0x08, 0x05, 0x10, 0x07,
+            ],
+            0,
+            3,
+            "enpm-two-det-skip",
+        );
+        // Duplicate keys collapse (last wins).
+        set.push_encode(
+            &mds,
+            &links,
+            &[
+                0x0A, 0x04, 0x08, 0x05, 0x10, 0x07, 0x0A, 0x04, 0x08, 0x05, 0x10, 0x02,
+            ],
+            0,
+            1,
+            "enpm-dup-det",
+        );
+        // NON-deterministic multi-entry map: the DUT emits insertion order,
+        // the oracle the table order; the court's semantic fallback parses
+        // both and compares dumps (classified map-order, NONDETERMINISM.md).
+        set.push_encode(
+            &mds,
+            &links,
+            &[
+                0x0A, 0x04, 0x08, 0x01, 0x10, 0x01, 0x0A, 0x04, 0x08, 0x03, 0x10, 0x03, 0x0A, 0x04,
+                0x08, 0x02, 0x10, 0x02,
+            ],
+            0,
+            0,
+            "enpm-three-nondet",
+        );
+        // Unknown-entry: the re-encoded entry becomes an unknown field and is
+        // emitted after the (absent) map content.
+        set.push_encode(
+            &mds,
+            &links,
+            &[0x0A, 0x05, 0x1D, 0x00, 0x00, 0x00, 0x00],
+            0,
+            0,
+            "enpm-unknown-entry",
+        );
+        // Unknown-entry plus a valid entry.
+        set.push_encode(
+            &mds,
+            &links,
+            &[
+                0x0A, 0x07, 0x08, 0x05, 0x1D, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x04, 0x08, 0x02, 0x10,
+                0x01,
+            ],
+            0,
+            0,
+            "enpm-unknown-then-valid",
+        );
+        set.push_encode(
+            &mds,
+            &links,
+            &[
+                0x0A, 0x07, 0x08, 0x05, 0x1D, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x04, 0x08, 0x02, 0x10,
+                0x01,
+            ],
+            0,
+            1,
+            "enpm-unknown-then-valid-det",
+        );
+    }
+    // Protoc-shape map with a message VALUE and a nested map.
+    {
+        let mds = vec![
+            md_fields(&[(1, 17 + REPEATED_BASE)]),
+            map_descriptor(7, 17),
+            md_fields(&[(1, 7)]),
+        ];
+        let links = vec![vec![1], vec![2], vec![]];
+        set.push_encode(
+            &mds,
+            &links,
+            &[0x0A, 0x06, 0x08, 0x05, 0x12, 0x02, 0x08, 0x01],
+            0,
+            0,
+            "enpm-msg-val",
+        );
+        set.push_encode(
+            &mds,
+            &links,
+            &[0x0A, 0x02, 0x08, 0x05],
+            0,
+            0,
+            "enpm-msg-val-absent",
+        );
+        // Value sub-message with its own unknown: inserted; the unknown lives
+        // inside the value.
+        set.push_encode(
+            &mds,
+            &links,
+            &[
+                0x0A, 0x09, 0x08, 0x05, 0x12, 0x05, 0x1D, 0x00, 0x00, 0x00, 0x00,
+            ],
+            0,
+            0,
+            "enpm-msg-val-unknown-inside",
+        );
+    }
+    // Deterministic ordering of string keys (map_sorter.c:76-83): primary
+    // bytewise DESCENDING, tie-break ascending size; the emitted order is the
+    // REVERSE of the sorted iteration (backward-built buffer, encoder.c:594-640).
+    {
+        let mds = vec![md_fields(&[(1, 17 + REPEATED_BASE)]), map_descriptor(15, 7)];
+        let links = vec![vec![1], vec![]];
+        // Inserted as "a", "b", "aa" -> deterministic emits "aa", "a", "b"
+        // (sorted descending "b", "a", "aa", emitted reversed).
+        set.push_encode(
+            &mds,
+            &links,
+            &[
+                0x0A, 0x05, 0x0A, 0x01, b'a', 0x10, 0x01, 0x0A, 0x05, 0x0A, 0x01, b'b', 0x10, 0x02,
+                0x0A, 0x06, 0x0A, 0x02, b'a', b'a', 0x10, 0x03,
+            ],
+            0,
+            1,
+            "enps-str-det",
+        );
+        // Inserted as "aa", "ab", "a" -> sorted "a", "ab", "aa" (size
+        // tie-break: "a" first; bytewise desc: "ab" before "aa"), emitted
+        // reversed: "aa", "ab", "a".
+        set.push_encode(
+            &mds,
+            &links,
+            &[
+                0x0A, 0x06, 0x0A, 0x02, b'a', b'a', 0x10, 0x01, 0x0A, 0x06, 0x0A, 0x02, b'a', b'b',
+                0x10, 0x02, 0x0A, 0x05, 0x0A, 0x01, b'a', 0x10, 0x03,
+            ],
+            0,
+            1,
+            "enps-str-det2",
+        );
+        // NON-deterministic multi-entry string map (fallback classification).
+        set.push_encode(
+            &mds,
+            &links,
+            &[
+                0x0A, 0x05, 0x0A, 0x01, b'a', 0x10, 0x01, 0x0A, 0x05, 0x0A, 0x01, b'b', 0x10, 0x02,
+                0x0A, 0x06, 0x0A, 0x02, b'a', b'a', 0x10, 0x03,
+            ],
+            0,
+            0,
+            "enps-three-nondet",
+        );
+    }
+    // Encode recursion depth: the encoder errors at `--e->depth == 0`, one
+    // level earlier than the decoder (`< 0`): D nested messages re-encode at
+    // max depth D as MaxDepthExceeded.
+    {
+        let mds = vec![md_fields(&[(1, 17)])];
+        let links = vec![vec![0]];
+        set.push_encode(
+            &mds,
+            &links,
+            &recursive_payload(99),
+            100,
+            0,
+            "ened-99-at-100",
+        );
+        set.push_encode(
+            &mds,
+            &links,
+            &recursive_payload(100),
+            100,
+            0,
+            "ened-100-at-100",
+        );
+        set.push_encode(
+            &mds,
+            &links,
+            &recursive_payload(101),
+            100,
+            0,
+            "ened-101-at-100",
+        );
+        set.push_encode(&mds, &links, &recursive_payload(49), 50, 0, "ened-49-at-50");
+        set.push_encode(&mds, &links, &recursive_payload(50), 50, 0, "ened-50-at-50");
+        set.push_encode(&mds, &links, &recursive_payload(51), 50, 0, "ened-51-at-50");
+    }
+    // Flagged-packed repeated fields in a pool schema: the packed flag on the
+    // descriptor selects the packed wire form on encode (encode_array,
+    // encoder.c:457-577).
+    {
+        let mut enc = MessageEncoder::new(MSG_MOD_DEFAULT_IS_PACKED);
+        enc.field(1, 7 + REPEATED_BASE, 0); // repeated uint32, default packed
+        let sub_packed = enc.finish();
+        let mds = vec![md_fields(&[(1, 17)]), sub_packed];
+        let links = vec![vec![1], vec![]];
+        set.push_encode(
+            &mds,
+            &links,
+            &[0x0A, 0x05, 0x0A, 0x03, 0x01, 0x02, 0x03],
+            0,
+            0,
+            "enpack-in-sub",
+        );
+        set.push_encode(
+            &mds,
+            &links,
+            &[0x0A, 0x02, 0x0A, 0x00],
+            0,
+            0,
+            "enpack-in-sub-empty",
+        );
+        // Unpacked wire input for a packed-flagged field: decode stores the
+        // elements; encode emits the PACKED form.
+        set.push_encode(
+            &mds,
+            &links,
+            &[0x0A, 0x06, 0x08, 0x01, 0x08, 0x02, 0x08, 0x03],
+            0,
+            0,
+            "enpack-in-sub-unpacked-input",
+        );
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut seed = DEFAULT_SEED;
@@ -2331,6 +2645,7 @@ fn main() {
     gen_mini_table_corpus(&mut set);
     gen_decode_known_corpus(&mut set);
     gen_decode_submsg_corpus(&mut set);
+    gen_encode_corpus(&mut set);
 
     fs::create_dir_all(&out).expect("create corpus dir");
     let cases_path = out.join("cases.jsonl");
