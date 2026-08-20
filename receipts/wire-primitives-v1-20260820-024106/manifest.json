@@ -1,0 +1,24 @@
+{
+  "court": "wire-primitives-v1",
+  "environment": {
+    "cases": "1537",
+    "corpus": "corpus/generated/wire-primitives-v1/cases.jsonl",
+    "oracle_binary": "tools/oracle/build/oracle",
+    "protocol_version": "1",
+    "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+    "seed": "0x7570627273",
+    "uname": "Linux vanir 7.1.8-1-cachyos #1 SMP PREEMPT_DYNAMIC Mon, 10 Aug 2026 19:39:40 +0000 x86_64 GNU/Linux",
+    "upstream": "2de70d710510ea7c5ad7ec0c72bfed7f411c7b60"
+  },
+  "run_id": "wire-primitives-v1-20260820-024106",
+  "summary": {
+    "corpus_version": "1",
+    "court": "wire-primitives-v1",
+    "date": "20260820-024106",
+    "equal": 1537,
+    "oracle": "2de70d710510ea7c5ad7ec0c72bfed7f411c7b60",
+    "residuals": 0,
+    "rust_revision": "ce0ec8c735c53192",
+    "total": 1537
+  }
+}

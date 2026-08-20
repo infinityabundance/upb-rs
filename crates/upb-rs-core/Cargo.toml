@@ -1,0 +1,11 @@
+[package]
+name = "upb-rs-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Core types and error model for upb-rs, mirroring upb/base and upb/wire/types.h"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

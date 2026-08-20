@@ -1,0 +1,4 @@
+# Pinned Rust toolchain for reproducible builds (see forensics/SOURCE_BASELINE.md).
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]

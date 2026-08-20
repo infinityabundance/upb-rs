@@ -1,0 +1,84 @@
+# PARITY.toml — machine-readable claim manifest
+
+# Every serious compatibility claim in upb-rs is tracked here. README badges
+# and the status dashboard derive from this file; humans do not edit marketing
+# claims independently of the evidence state (§46 of the charter).
+#
+# status values: unmapped | mapped | modeled | implemented | oracle-tested |
+#                residuals-open | parity-sealed
+
+[meta]
+upstream = "2de70d710510ea7c5ad7ec0c72bfed7f411c7b60"
+schema_version = 1
+updated = "2026-08-20"
+
+[wire.decode.varint]
+status = "oracle-tested"
+oracle = "protobuf:2de70d710510ea7c5ad7ec0c72bfed7f411c7b60"
+court = "wire-primitives-v1"
+residuals = 0
+note = "u64 varint reading incl. 10-byte bound, continuation semantics, (byte-1)<<7i arithmetic, zero-padded truncation semantics"
+
+[wire.decode.tag]
+status = "oracle-tested"
+oracle = "protobuf:2de70d710510ea7c5ad7ec0c72bfed7f411c7b60"
+court = "wire-primitives-v1"
+residuals = 0
+note = "5-byte bound, UINT32_MAX rejection"
+
+[wire.decode.size]
+status = "oracle-tested"
+oracle = "protobuf:2de70d710510ea7c5ad7ec0c72bfed7f411c7b60"
+court = "wire-primitives-v1"
+residuals = 0
+note = "5-byte bound, INT32_MAX rejection"
+
+[wire.decode.fixed]
+status = "oracle-tested"
+oracle = "protobuf:2de70d710510ea7c5ad7ec0c72bfed7f411c7b60"
+court = "wire-primitives-v1"
+residuals = 0
+note = "fixed32/fixed64 little-endian reads incl. truncated (zero-padded) inputs"
+
+[wire.decode.skip]
+status = "oracle-tested"
+oracle = "protobuf:2de70d710510ea7c5ad7ec0c72bfed7f411c7b60"
+court = "wire-primitives-v1"
+residuals = 0
+note = "skip_varint/skip_value/skip_group incl. depth limit 100, field-number-0 rejection, wire types 6/7 rejection, CheckSize discipline"
+
+[wire.decode.message]
+status = "unmapped"
+
+[wire.encode]
+status = "unmapped"
+
+[mini_table]
+status = "unmapped"
+
+[mini_descriptor]
+status = "unmapped"
+
+[arena]
+status = "mapped"
+
+[reflection]
+status = "unmapped"
+
+[json]
+status = "unmapped"
+
+[text]
+status = "unmapped"
+
+[unknown_fields]
+status = "unmapped"
+
+[rust_kernel]
+status = "unmapped"
+
+[c_abi]
+status = "unmapped"
+
+[conformance]
+status = "unmapped"

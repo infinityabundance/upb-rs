@@ -1,0 +1,39 @@
+# upb-rs workspace root.
+#
+# upb-rs is a custodial native-Rust reimplementation of Google's upb (μpb)
+# Protocol Buffers runtime, engineered for observable-behavior parity against
+# a pinned upstream oracle. See STATUS.md, PARITY.toml, and forensics/ for the
+# evidence architecture.
+#
+# The pinned upstream oracle lives in third_party/protobuf (see
+# third_party/protobuf/PIN.md). Nothing in the production crates may link
+# against, call, or depend on the C implementation; the oracle is used only by
+# differential courts, conformance tooling, and benchmarks (see §6, §19).
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/upb-rs",
+    "crates/upb-rs-core",
+    "crates/upb-rs-wire",
+    "crates/upb-rs-oracle",
+    "crates/upb-rs-casefile",
+    "tools/corpus",
+    "courts/wire-primitives",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+rust-version = "1.96"
+repository = "https://github.com/infinityabundance/upb-rs"
+homepage = "https://github.com/infinityabundance/upb-rs"
+documentation = "https://docs.rs/upb-rs"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+debug = true

@@ -1,0 +1,13 @@
+[package]
+name = "court-wire-primitives"
+version = "0.1.0"
+edition = "2021"
+description = "Differential court: primitive wire decoding, oracle (pinned C upb) vs DUT (upb-rs-wire)"
+
+[dependencies]
+upb-rs-core = { path = "../../crates/upb-rs-core" }
+upb-rs-wire = { path = "../../crates/upb-rs-wire" }
+upb-rs-oracle = { path = "../../crates/upb-rs-oracle" }
+upb-rs-casefile = { path = "../../crates/upb-rs-casefile" }
+serde = { workspace = true }
+serde_json = { workspace = true }

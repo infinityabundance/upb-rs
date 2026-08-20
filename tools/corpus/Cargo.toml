@@ -1,0 +1,9 @@
+[package]
+name = "corpus-gen"
+version = "0.1.0"
+edition = "2021"
+description = "Deterministic corpus generator for upb-rs differential courts"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

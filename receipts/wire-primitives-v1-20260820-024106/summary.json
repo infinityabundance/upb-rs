@@ -1,0 +1,10 @@
+{
+  "court": "wire-primitives-v1",
+  "oracle": "2de70d710510ea7c5ad7ec0c72bfed7f411c7b60",
+  "total": 1537,
+  "equal": 1537,
+  "residuals": 0,
+  "corpus_version": "1",
+  "rust_revision": "ce0ec8c735c53192",
+  "date": "20260820-024106"
+}

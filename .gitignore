@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+Cargo.lock.orig
+third_party/protobuf/
+third_party/build/
+tools/oracle/build/
+receipts/*/
+!receipts/.gitkeep
+corpus/generated/
+!corpus/.gitkeep
+fuzz/target/
+.vscode/
+.idea/
+*.swp

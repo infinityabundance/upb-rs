@@ -1,0 +1,15 @@
+[package]
+name = "upb-rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Custodial native-Rust reimplementation of Google's upb (μpb) protobuf runtime, engineered for observable-behavior parity against pinned upstream"
+keywords = ["protobuf", "upb", "protobuf-runtime", "wire-format", "parity"]
+categories = ["encoding", "parser-implementations", "no-std"]
+
+[dependencies]
+upb-rs-core = { version = "0.1.0", path = "../upb-rs-core" }
+upb-rs-wire = { version = "0.1.0", path = "../upb-rs-wire" }
+upb-rs-oracle = { version = "0.1.0", path = "../upb-rs-oracle" }
+upb-rs-casefile = { version = "0.1.0", path = "../upb-rs-casefile" }
