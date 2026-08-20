@@ -1,0 +1,10 @@
+{
+  "court": "mini-table-inspect-v1",
+  "oracle": "2de70d710510ea7c5ad7ec0c72bfed7f411c7b60",
+  "total": 701,
+  "equal": 701,
+  "residuals": 0,
+  "corpus_version": "1",
+  "rust_revision": "cb3a5916160f3b77",
+  "date": "20260820-030943"
+}

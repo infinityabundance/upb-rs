@@ -116,6 +116,12 @@ pub struct OracleResponse {
     /// decode_empty: the re-encoded bytes on success.
     #[serde(default)]
     pub hex_out: Option<String>,
+    /// mini_table_inspect: the normalized mini table rendering on success.
+    #[serde(default)]
+    pub mini_table: Option<serde_json::Value>,
+    /// mini_table_inspect error: the upstream error message.
+    #[serde(default)]
+    pub msg: Option<String>,
 }
 
 impl OracleResponse {

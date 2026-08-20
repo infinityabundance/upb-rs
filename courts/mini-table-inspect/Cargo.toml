@@ -1,0 +1,12 @@
+[package]
+name = "court-mini-table-inspect"
+version = "0.1.0"
+edition = "2021"
+description = "Differential court: mini descriptor decoding and mini table layout, oracle (upb_MiniTable_Build) vs DUT (upb-rs-mini-table)"
+
+[dependencies]
+upb-rs-mini-table = { path = "../../crates/upb-rs-mini-table" }
+upb-rs-oracle = { path = "../../crates/upb-rs-oracle" }
+upb-rs-casefile = { path = "../../crates/upb-rs-casefile" }
+serde = { workspace = true }
+serde_json = { workspace = true }

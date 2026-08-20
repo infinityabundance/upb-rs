@@ -162,6 +162,21 @@ impl OracleClient {
         let req = OracleRequest::decode_empty(id, payload, depth);
         self.request(&req)
     }
+
+    /// Sends a mini_table_inspect request.
+    pub fn mini_table_inspect(&mut self, descriptor: &[u8]) -> Result<OracleResponse, OracleError> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let req = OracleRequest {
+            v: 1,
+            id,
+            op: "mini_table_inspect".to_string(),
+            hex: crate::protocol::hex_encode(descriptor),
+            tag: None,
+            depth: None,
+        };
+        self.request(&req)
+    }
 }
 
 impl Drop for OracleClient {

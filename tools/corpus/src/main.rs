@@ -12,6 +12,7 @@
 //!   cargo run --manifest-path tools/corpus/Cargo.toml -- \
 //!     --seed 0x7570627273 --out corpus/generated/wire-primitives-v1
 
+mod mdgen;
 mod rng;
 
 use rng::SplitMix64;
@@ -572,6 +573,322 @@ fn gen_decode_empty_corpus(set: &mut CaseSet) {
     set.push_truncations("decode_empty", None, &rep, "msg-rep");
 }
 
+fn gen_mini_table_corpus(set: &mut CaseSet) {
+    use mdgen::*;
+
+    // --- Valid messages ---------------------------------------------------
+    // Empty.
+    set.push("mini_table_inspect", None, b"", "mt-empty");
+    set.push("mini_table_inspect", None, b"$", "mt-empty-msg");
+
+    // Every scalar encoded type (0..=18).
+    for t in 0..=18usize {
+        let mut enc = MessageEncoder::new(0);
+        enc.field(1, t, 0);
+        set.push(
+            "mini_table_inspect",
+            None,
+            &enc.finish(),
+            &format!("mt-scalar-t{t}"),
+        );
+    }
+    // Every repeated encoded type (20..=38).
+    for t in 0..=18usize {
+        let mut enc = MessageEncoder::new(0);
+        enc.field(1, t + REPEATED_BASE, 0);
+        set.push(
+            "mini_table_inspect",
+            None,
+            &enc.finish(),
+            &format!("mt-repeated-t{t}"),
+        );
+    }
+
+    // Message modifiers: all 8 combinations.
+    for msg_mod in 0..8u32 {
+        let mut enc = MessageEncoder::new(msg_mod);
+        enc.field(1, 15, 0); // String (UTF-8 flip interplay)
+        enc.field(2, 7 + REPEATED_BASE, 0); // repeated UInt32 (packing)
+        enc.field(3, 13, 0); // Bool
+        set.push(
+            "mini_table_inspect",
+            None,
+            &enc.finish(),
+            &format!("mt-msgmod-{msg_mod}"),
+        );
+    }
+
+    // Field modifiers: FlipPacked, required, proto3 singular, FlipValidateUtf8.
+    for &(t, modifiers, msg_mod, kind) in &[
+        (
+            7usize + REPEATED_BASE,
+            MOD_FLIP_PACKED,
+            0u32,
+            "mt-flippacked",
+        ),
+        (
+            7usize + REPEATED_BASE,
+            MOD_FLIP_PACKED,
+            MSG_MOD_DEFAULT_IS_PACKED,
+            "mt-flippacked2",
+        ),
+        (15usize, MOD_FLIP_VALIDATE_UTF8, 0, "mt-fliputf8"),
+        (13usize, MOD_IS_REQUIRED, 0, "mt-required"),
+        (13usize, MOD_IS_PROTO3_SINGULAR, 0, "mt-proto3sing"),
+        (
+            15usize,
+            MOD_FLIP_VALIDATE_UTF8,
+            MSG_MOD_VALIDATE_UTF8,
+            "mt-fliputf8-off",
+        ),
+    ] {
+        let mut enc = MessageEncoder::new(msg_mod);
+        enc.field(1, t, modifiers);
+        set.push("mini_table_inspect", None, &enc.finish(), kind);
+    }
+    // Invalid: flip packed on a string, flip utf8 on non-string, singular
+    // submessage, singular+required, required repeated.
+    set.push(
+        "mini_table_inspect",
+        None,
+        &{
+            let mut e = MessageEncoder::new(0);
+            e.field(1, 15, MOD_FLIP_PACKED); // String cannot be packed
+            e.finish()
+        },
+        "mt-inval-flippacked-string",
+    );
+    set.push(
+        "mini_table_inspect",
+        None,
+        &{
+            let mut e = MessageEncoder::new(0);
+            e.field(1, 7, MOD_FLIP_VALIDATE_UTF8); // UInt32 is not alternate bytes
+            e.finish()
+        },
+        "mt-inval-fliputf8",
+    );
+    set.push(
+        "mini_table_inspect",
+        None,
+        &{
+            let mut e = MessageEncoder::new(0);
+            e.field(1, 17, MOD_IS_PROTO3_SINGULAR); // singular message
+            e.finish()
+        },
+        "mt-inval-singular-msg",
+    );
+    set.push(
+        "mini_table_inspect",
+        None,
+        &{
+            let mut e = MessageEncoder::new(0);
+            e.field(1, 13, MOD_IS_PROTO3_SINGULAR | MOD_IS_REQUIRED);
+            e.finish()
+        },
+        "mt-inval-singreq",
+    );
+    set.push(
+        "mini_table_inspect",
+        None,
+        &{
+            let mut e = MessageEncoder::new(0);
+            e.field(1, 7 + REPEATED_BASE, MOD_IS_REQUIRED); // required repeated
+            e.finish()
+        },
+        "mt-inval-req-repeated",
+    );
+
+    // Skips / sparse field numbers.
+    for &num in &[2u32, 3, 15, 16, 100, 0x3FFF, 0x4000, (1u32 << 29) - 1] {
+        let mut enc = MessageEncoder::new(0);
+        enc.field(1, 13, 0);
+        enc.field(num, 13, 0);
+        set.push(
+            "mini_table_inspect",
+            None,
+            &enc.finish(),
+            &format!("mt-skip-{num}"),
+        );
+    }
+    // Skip value 0 (invalid): a bare '_' encodes skip 0.
+    set.push("mini_table_inspect", None, b"$_", "mt-skip0");
+
+    // Oneofs.
+    for &(n_fields, oneof_members) in &[
+        (2usize, 2usize), // both in one oneof
+        (3, 2),           // two of three in a oneof
+        (5, 3),
+        (3, 3),
+    ] {
+        let mut enc = MessageEncoder::new(0);
+        for i in 1..=n_fields {
+            enc.field(i as u32, 7, 0); // UInt32
+        }
+        enc.start_oneofs();
+        for i in 1..=oneof_members {
+            enc.oneof_field(i as u32, i == 1);
+        }
+        set.push(
+            "mini_table_inspect",
+            None,
+            &enc.finish(),
+            &format!("mt-oneof-{n_fields}-{oneof_members}"),
+        );
+    }
+    // Mixed-rep oneof: int32 + string + submessage.
+    {
+        let mut enc = MessageEncoder::new(0);
+        enc.field(1, 6, 0); // Int32
+        enc.field(2, 15, 0); // String
+        enc.field(3, 17, 0); // Message
+        enc.start_oneofs();
+        enc.oneof_field(1, true);
+        enc.oneof_field(2, false);
+        enc.oneof_field(3, false);
+        set.push(
+            "mini_table_inspect",
+            None,
+            &enc.finish(),
+            "mt-oneof-mixedrep",
+        );
+    }
+    // Multiple oneofs.
+    {
+        let mut enc = MessageEncoder::new(0);
+        enc.field(1, 7, 0);
+        enc.field(2, 6, 0);
+        enc.field(3, 13, 0);
+        enc.field(4, 9, 0); // Int64
+        enc.start_oneofs();
+        enc.oneof_field(1, true);
+        enc.oneof_field(2, false);
+        enc.oneof_field(3, true);
+        enc.oneof_field(4, false);
+        set.push("mini_table_inspect", None, &enc.finish(), "mt-two-oneofs");
+    }
+    // Oneof referencing a repeated field (invalid).
+    {
+        let mut enc = MessageEncoder::new(0);
+        enc.field(1, 7 + REPEATED_BASE, 0);
+        enc.start_oneofs();
+        enc.oneof_field(1, true);
+        set.push(
+            "mini_table_inspect",
+            None,
+            &enc.finish(),
+            "mt-inval-oneof-repeated",
+        );
+    }
+    // Oneof referencing a missing field (invalid).
+    {
+        let mut enc = MessageEncoder::new(0);
+        enc.field(1, 7, 0);
+        enc.start_oneofs();
+        enc.oneof_field(9, true);
+        set.push(
+            "mini_table_inspect",
+            None,
+            &enc.finish(),
+            "mt-inval-oneof-missing",
+        );
+    }
+    // Empty oneof (invalid).
+    set.push("mini_table_inspect", None, b"$^", "mt-inval-oneof-empty");
+
+    // --- Maps -------------------------------------------------------------
+    for &(k, v) in &[
+        (7usize, 6usize),        // UInt32 -> Int32
+        (13, 6),                 // Bool -> Int32
+        (0, 9),                  // Double -> Int64
+        (6, 17),                 // Int32 -> Message
+        (14, 15),                // Bytes -> String (invalid key)
+        (2, 7),                  // Fixed32 -> UInt32
+        (9, 0),                  // Int64 -> Double
+        (15, 15),                // String -> String (invalid key)
+        (14 + REPEATED_BASE, 6), // repeated key (invalid)
+        (7, 10),                 // UInt32 -> Group (invalid val)
+    ] {
+        set.push(
+            "mini_table_inspect",
+            None,
+            &map_descriptor(k, v),
+            &format!("mt-map-k{k}-v{v}"),
+        );
+    }
+    // Map with 1 or 3 fields (invalid).
+    set.push("mini_table_inspect", None, b"%)", "mt-map-1field");
+    set.push("mini_table_inspect", None, b"%)()", "mt-map-3field");
+
+    // --- MessageSet -------------------------------------------------------
+    set.push(
+        "mini_table_inspect",
+        None,
+        &messageset_descriptor(),
+        "mt-messageset",
+    );
+    set.push("mini_table_inspect", None, b"&A", "mt-messageset-data");
+
+    // --- Invalid descriptors ---------------------------------------------
+    set.push("mini_table_inspect", None, b"X", "mt-inval-version");
+    set.push("mini_table_inspect", None, b"$", "mt-just-dollar");
+    set.push("mini_table_inspect", None, b"$J", "mt-inval-char-J");
+    set.push("mini_table_inspect", None, b"$K", "mt-inval-char-K");
+    set.push(
+        "mini_table_inspect",
+        None,
+        &[b'$', 0x7F],
+        "mt-inval-char-7f",
+    );
+    set.push("mini_table_inspect", None, &[b'$', 0x01], "mt-inval-ctrl");
+    set.push("mini_table_inspect", None, &[b'$', 0xFF], "mt-inval-ff");
+    set.push("mini_table_inspect", None, &[b'$', 0x80], "mt-inval-80");
+    set.push("mini_table_inspect", None, b"$^", "mt-inval-empty-oneof");
+
+    // Overlong modifier varint: 'L' followed by many '[' chars.
+    {
+        let mut raw = vec![b'$', b'L'];
+        raw.extend(std::iter::repeat_n(b'[', 12));
+        set.push("mini_table_inspect", None, &raw, "mt-inval-overlong-varint");
+    }
+
+    // --- Seeded random descriptors ----------------------------------------
+    let mut rng = SplitMix64::new(0x5EED_2026);
+    for i in 0..400 {
+        let n_fields = 1 + (rng.next_u64() % 8) as usize;
+        let mut enc = MessageEncoder::new((rng.next_u64() % 8) as u32);
+        let mut num = 1u32;
+        for _ in 0..n_fields {
+            num += 1 + (rng.next_u64() % 4) as u32; // sometimes sparse, always ascending
+            let t = (rng.next_u64() % 39) as usize; // 0..38 incl repeated
+            let mods = (rng.next_u64() % 16) as u32;
+            enc.field(num, t, mods);
+        }
+        if rng.next_u64().is_multiple_of(2) {
+            enc.start_oneofs();
+            let members = 1 + (rng.next_u64() % n_fields as u64) as u32;
+            for m in 1..=members {
+                enc.oneof_field(m, m == 1);
+            }
+        }
+        set.push(
+            "mini_table_inspect",
+            None,
+            &enc.finish(),
+            &format!("mt-random-{i}"),
+        );
+    }
+    // Raw random byte soup.
+    for i in 0..200 {
+        let len = 1 + (rng.next_u64() % 24) as usize;
+        let mut raw = Vec::with_capacity(len);
+        for _ in 0..len {
+            raw.push((rng.next_u64() & 0xFF) as u8);
+        }
+        set.push("mini_table_inspect", None, &raw, &format!("mt-soup-{i}"));
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut seed = DEFAULT_SEED;
@@ -604,6 +921,7 @@ fn main() {
     gen_skip_value_corpus(&mut set);
     gen_skip_group_corpus(&mut set);
     gen_decode_empty_corpus(&mut set);
+    gen_mini_table_corpus(&mut set);
 
     fs::create_dir_all(&out).expect("create corpus dir");
     let cases_path = out.join("cases.jsonl");

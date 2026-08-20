@@ -1,0 +1,18 @@
+{
+  "cases": 701,
+  "corpus": "corpus/generated/wire-primitives-v1/cases.jsonl",
+  "court": "mini-table-inspect-v1",
+  "oracle_binary": "tools/oracle/build/oracle",
+  "run_id": "mini-table-inspect-v1-20260820-030943",
+  "summary": {
+    "corpus_version": "1",
+    "court": "mini-table-inspect-v1",
+    "date": "20260820-030943",
+    "equal": 701,
+    "oracle": "2de70d710510ea7c5ad7ec0c72bfed7f411c7b60",
+    "residuals": 0,
+    "rust_revision": "cb3a5916160f3b77",
+    "total": 701
+  },
+  "upstream": "2de70d710510ea7c5ad7ec0c72bfed7f411c7b60"
+}

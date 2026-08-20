@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "upb-rs-mini-table",
 ]
 
 [[package]]
@@ -20,6 +21,17 @@ dependencies = [
  "upb-rs-core",
  "upb-rs-oracle",
  "upb-rs-wire",
+]
+
+[[package]]
+name = "court-mini-table-inspect"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "upb-rs-casefile",
+ "upb-rs-mini-table",
+ "upb-rs-oracle",
 ]
 
 [[package]]
@@ -126,10 +138,11 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
 name = "upb-rs"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "upb-rs-casefile",
  "upb-rs-core",
+ "upb-rs-mini-table",
  "upb-rs-oracle",
  "upb-rs-wire",
 ]
@@ -148,6 +161,15 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "upb-rs-mini-table"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "upb-rs-core",
 ]
 
 [[package]]

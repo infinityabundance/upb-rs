@@ -7,3 +7,4 @@ description = "Deterministic corpus generator for upb-rs differential courts"
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+upb-rs-mini-table = { version = "0.1.0", path = "../../crates/upb-rs-mini-table" }

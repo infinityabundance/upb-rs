@@ -17,8 +17,8 @@ happy-path tests.
 | wire decode: message (empty mini table, pure unknown fields) | ORACLE-TESTED | courts/decode-empty (338 cases, 0 residuals) |
 | wire decode: message      | UNMAPPED      | —                                                     |
 | wire encode               | UNMAPPED      | —                                                     |
-| mini tables               | UNMAPPED      | —                                                     |
-| mini descriptors          | UNMAPPED      | —                                                     |
+| mini tables               | ORACLE-TESTED | courts/mini-table-inspect (701 cases, 0 residuals)  |
+| mini descriptors          | ORACLE-TESTED | courts/mini-table-inspect (701 cases, 0 residuals)  |
 | arena / memory            | MAPPED        | forensics/MEMORY_MODEL.md                             |
 | error model               | MAPPED        | forensics/ERROR_MODEL.md                              |
 | reflection                | UNMAPPED      | —                                                     |

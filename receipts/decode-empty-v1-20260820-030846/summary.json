@@ -1,0 +1,10 @@
+{
+  "court": "decode-empty-v1",
+  "oracle": "2de70d710510ea7c5ad7ec0c72bfed7f411c7b60",
+  "total": 338,
+  "equal": 338,
+  "residuals": 0,
+  "corpus_version": "1",
+  "rust_revision": "eaacdd39419c18bf",
+  "date": "20260820-030846"
+}

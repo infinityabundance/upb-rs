@@ -18,8 +18,10 @@
 //!
 //! * [`core`](upb_rs_core) — wire constants and the upb error model
 //!   (`upb/wire/types.h`, `upb/base/error_handler.h` semantics)
-//! * [`wire`](upb_rs_wire) — binary wire-format reader
-//!   (`upb_EpsCopyInputStream` + `upb_WireReader` semantics)
+//! * [`wire`](upb_rs_wire) — binary wire-format reader and message decode
+//!   (`upb_EpsCopyInputStream` + `upb_WireReader` + empty-mini-table decode)
+//! * [`mini_table`](upb_rs_mini_table) — mini descriptor decoding and the
+//!   mini table layout model (`upb/mini_descriptor/*`, `upb/mini_table/*`)
 //! * [`oracle`](upb_rs_oracle) — client for the pinned upstream C upb oracle
 //!   (differential-court tooling only)
 //! * [`casefile`](upb_rs_casefile) — machine-readable residual casefile model
@@ -44,5 +46,6 @@
 
 pub use upb_rs_casefile as casefile;
 pub use upb_rs_core as core;
+pub use upb_rs_mini_table as mini_table;
 pub use upb_rs_oracle as oracle;
 pub use upb_rs_wire as wire;

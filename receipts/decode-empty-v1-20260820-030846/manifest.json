@@ -1,0 +1,18 @@
+{
+  "cases": 338,
+  "corpus": "corpus/generated/wire-primitives-v1/cases.jsonl",
+  "court": "decode-empty-v1",
+  "oracle_binary": "tools/oracle/build/oracle",
+  "run_id": "decode-empty-v1-20260820-030846",
+  "summary": {
+    "corpus_version": "1",
+    "court": "decode-empty-v1",
+    "date": "20260820-030846",
+    "equal": 338,
+    "oracle": "2de70d710510ea7c5ad7ec0c72bfed7f411c7b60",
+    "residuals": 0,
+    "rust_revision": "eaacdd39419c18bf",
+    "total": 338
+  },
+  "upstream": "2de70d710510ea7c5ad7ec0c72bfed7f411c7b60"
+}

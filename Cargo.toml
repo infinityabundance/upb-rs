@@ -18,9 +18,11 @@ members = [
     "crates/upb-rs-wire",
     "crates/upb-rs-oracle",
     "crates/upb-rs-casefile",
+    "crates/upb-rs-mini-table",
     "tools/corpus",
     "courts/wire-primitives",
     "courts/decode-empty",
+    "courts/mini-table-inspect",
 ]
 
 [workspace.package]

@@ -31,7 +31,8 @@ every request (even malformed ones), so courts can pair them by `id`.
 {"v":1,"id":7,"op":"skip_value","tag":10,"hex":"03aabbcc"}
 {"v":1,"id":8,"op":"skip_group","tag":11,"hex":"12 34 0c"}   // group body, tag = start-group tag value
 {"v":1,"id":9,"op":"decode_empty","hex":"0801","depth":100}
-{"v":1,"id":10,"op":"ping"}
+{"v":1,"id":10,"op":"mini_table_inspect","hex":"2429"}
+{"v":1,"id":11,"op":"ping"}
 ```
 
 `hex` is the payload (after any tag), lowercase hex, no spaces. `tag` is the
@@ -84,7 +85,31 @@ already-parsed tag value (`field_number << 3 | wire_type`), decimal.
 | `skip_value`  | `upb_WireReader_SkipValue`    | —   | wire type from tag; depth limit 100 |
 | `skip_group`  | `upb_WireReader_SkipGroup`    | —   | recursive; depth limit 100 |
 | `decode_empty`| `upb_Decode` (empty mini table)| —   | real message decode; every field is unknown; see below |
+| `mini_table_inspect`| `upb_MiniTable_Build` | — | builds a mini table from a mini descriptor; see below |
 | `ping`        | —                        | —   | protocol self-test |
+
+## `mini_table_inspect`
+
+Builds a mini table from a mini descriptor string (the `hex` payload is the
+raw descriptor bytes, typically ASCII like `$)` or `%)(`) using the pinned
+`upb_MiniTable_Build`, then renders a normalized machine-readable form
+(charter §11). The Rust DUT must produce the identical rendering:
+
+```json
+{"status":"ok","mini_table":{
+  "version":"$", "size":16, "field_count":1, "dense_below":1,
+  "ext":0, "required_count":0,
+  "fields":[{"number":1,"type":13,"mode":66,"offset":12,
+              "presence":64,"submsg_ofs":65535}],
+  "oneofs":[]
+}}
+```
+
+Error responses carry the upstream message, e.g.
+`{"status":"error","code":"build_failed","msg":"Error building mini table: Invalid char: J"}`.
+String parity is pinned-version scope; the shared escaping convention renders
+non-printable bytes as the 6-character literal `\u00xx` and NUL as the
+termination of the C status string.
 
 ## `decode_empty`
 

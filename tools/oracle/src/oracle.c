@@ -27,6 +27,7 @@
 #include "upb/mem/arena.h"
 #include "upb/message/message.h"
 #include "upb/mini_descriptor/decode.h"
+#include "upb/mini_table/message.h"
 #include "upb/wire/decode.h"
 #include "upb/wire/encode.h"
 #include "upb/wire/eps_copy_input_stream.h"
@@ -417,6 +418,119 @@ static void run_decode_empty(int64_t id, const char* hex, int64_t depth) {
 }
 
 // ---------------------------------------------------------------------------
+// mini_table_inspect: builds a mini table from a mini descriptor string via
+// the pinned upb_MiniTable_Build and renders a normalized machine-readable
+// form (charter §11). The Rust DUT must produce the identical rendering.
+// ---------------------------------------------------------------------------
+
+// Emits a JSON string literal. Convention (shared with the DUT): printable
+// ASCII is emitted raw (with \" and \\ escaped); every other byte is rendered
+// as the 6-character literal \u00xx (backslash escaped), so both sides produce
+// identical *decoded* strings.
+static void emit_json_string_raw(const char* s) {
+  printf("\"");
+  for (const unsigned char* p = (const unsigned char*)s; *p; p++) {
+    if (*p == '"' || *p == '\\') {
+      printf("\\%c", *p);
+    } else if (*p >= 0x20 && *p <= 0x7e) {
+      putchar(*p);
+    } else {
+      printf("\\\\u00%02x", *p);
+    }
+  }
+  printf("\"");
+}
+
+static void run_mini_table_inspect(int64_t id, const char* hex) {
+  uint8_t input[MAX_INPUT_BYTES];
+  int n = parse_hex(hex, strlen(hex), input, sizeof(input));
+  if (n < 0) {
+    emit_header(id, "error");
+    emit_field_str("code", "bad_hex");
+    emit_end();
+    return;
+  }
+
+  upb_Arena* arena = upb_Arena_New();
+  upb_Status status;
+  upb_Status_Clear(&status);
+  upb_MiniTable* mt =
+      upb_MiniTable_Build((const char*)input, (size_t)n, arena, &status);
+  if (!mt) {
+    emit_header(id, "error");
+    emit_field_str("code", "build_failed");
+    printf(",\"msg\":");
+    emit_json_string_raw(status.msg);
+    emit_end();
+    upb_Arena_Free(arena);
+    return;
+  }
+
+  int field_count = upb_MiniTable_FieldCount(mt);
+  emit_header(id, "ok");
+  printf(",\"mini_table\":{");
+  printf("\"version\":");
+  if (n) {
+    char v[2] = {(char)input[0], 0};
+    emit_json_string_raw(v);
+  } else {
+    printf("null");
+  }
+  printf(",\"size\":%u", mt->size_dont_copy_me__upb_internal_use_only);
+  printf(",\"field_count\":%u", mt->field_count_dont_copy_me__upb_internal_use_only);
+  printf(",\"dense_below\":%u", mt->dense_below_dont_copy_me__upb_internal_use_only);
+  printf(",\"ext\":%u", mt->ext_dont_copy_me__upb_internal_use_only);
+  printf(",\"required_count\":%u", mt->required_count_dont_copy_me__upb_internal_use_only);
+  printf(",\"fields\":[");
+  for (int i = 0; i < field_count; i++) {
+    if (i) printf(",");
+    const upb_MiniTableField* f = upb_MiniTable_GetFieldByIndex(mt, i);
+    printf("{");
+    printf("\"number\":%u", f->number_dont_copy_me__upb_internal_use_only);
+    printf(",\"type\":%u", f->descriptortype_dont_copy_me__upb_internal_use_only);
+    printf(",\"mode\":%u", f->mode_dont_copy_me__upb_internal_use_only);
+    printf(",\"offset\":%u", f->offset_dont_copy_me__upb_internal_use_only);
+    printf(",\"presence\":%d", (int)f->presence);
+    printf(",\"submsg_ofs\":%u", f->submsg_ofs_dont_copy_me__upb_internal_use_only);
+    printf("}");
+  }
+  printf("],\"oneofs\":[");
+  // Group oneof fields by their (negated) case offset.
+  int first = 1;
+  for (int i = 0; i < field_count; i++) {
+    const upb_MiniTableField* f = upb_MiniTable_GetFieldByIndex(mt, i);
+    if (f->presence >= 0) continue;
+    int case_offset = ~f->presence;
+    // Only emit each distinct case offset once; collect members.
+    int already = 0;
+    for (int j = 0; j < i; j++) {
+      const upb_MiniTableField* g = upb_MiniTable_GetFieldByIndex(mt, j);
+      if (g->presence < 0 && (~g->presence) == case_offset) {
+        already = 1;
+        break;
+      }
+    }
+    if (already) continue;
+    if (!first) printf(",");
+    first = 0;
+    printf("{\"case_offset\":%d,\"members\":[", case_offset);
+    int mfirst = 1;
+    for (int j = 0; j < field_count; j++) {
+      const upb_MiniTableField* g = upb_MiniTable_GetFieldByIndex(mt, j);
+      if (g->presence < 0 && (~g->presence) == case_offset) {
+        if (!mfirst) printf(",");
+        mfirst = 0;
+        printf("%d", j);
+      }
+    }
+    printf("]}");
+  }
+  printf("]}");
+  emit_end();
+  upb_Arena_Free(arena);
+}
+
+// ---------------------------------------------------------------------------
 // Main loop
 // ---------------------------------------------------------------------------
 
@@ -484,6 +598,8 @@ int main(void) {
       int64_t depth = 0;
       json_int(line, "\"depth\"", &depth);  // optional; 0 -> default 100
       run_decode_empty(id, hex, depth);
+    } else if (strcmp(op, "mini_table_inspect") == 0) {
+      run_mini_table_inspect(id, hex);
     } else {
       emit_header(id, "error");
       emit_field_str("code", "unknown_op");
