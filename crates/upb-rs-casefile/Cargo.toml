@@ -3,6 +3,8 @@ name = "upb-rs-casefile"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 rust-version.workspace = true
 description = "Casefile model: permanent records of residuals between upb-rs and the pinned oracle"
 

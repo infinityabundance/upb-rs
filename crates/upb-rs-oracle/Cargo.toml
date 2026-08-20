@@ -3,6 +3,8 @@ name = "upb-rs-oracle"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 rust-version.workspace = true
 description = "Client for the pinned upstream upb oracle (tools/oracle), protocol v1"
 
