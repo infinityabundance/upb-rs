@@ -639,7 +639,83 @@ static void emit_msg_value(const upb_Message* msg, const upb_MiniTable* mt) {
     uint8_t type = f->descriptortype_dont_copy_me__upb_internal_use_only;
     uint16_t offset = f->offset_dont_copy_me__upb_internal_use_only;
     int is_array = (f->mode_dont_copy_me__upb_internal_use_only & 3) == 1;
+    int is_map = (f->mode_dont_copy_me__upb_internal_use_only & 3) == 0;
     int is_submsg = field_is_submsg(f);
+    if (is_map) {
+      // Map fields carry no presence (the decoder never sets the hasbit);
+      // render the map content whenever the pointer slot is non-NULL,
+      // mirroring the array branch (always emitted, empty when NULL).
+      if (!first_emitted) printf(",");
+      first_emitted = 0;
+      printf("{\"number\":%u,\"value\":[", number);
+      const upb_Map* map = *(const upb_Map**)((const char*)msg + offset);
+      if (map) {
+        const upb_MiniTable* entry = upb_MiniTable_GetSubMessageTable(f);
+        int val_is_msg =
+            entry && upb_MiniTable_GetFieldByIndex(entry, 1)
+                          ->descriptortype_dont_copy_me__upb_internal_use_only ==
+                      11;
+        const upb_MiniTable* val_sub =
+            val_is_msg ? upb_MiniTable_GetSubMessageTable(
+                             upb_MiniTable_GetFieldByIndex(entry, 1))
+                       : NULL;
+        upb_MessageValue keys[128], vals[128];
+        char keyhex[128][64];
+        size_t key_size = map->key_size, val_size = map->val_size;
+        size_t iter = kUpb_Map_Begin;
+        int n = 0;
+        while (upb_Map_Next(map, &keys[n], &vals[n], &iter) && n < 128) {
+          size_t o = 0;
+          if (key_size == 0) {
+            for (size_t j = 0;
+                 j < keys[n].str_val.size && o + 1 < sizeof(keyhex[n]); j++) {
+              o += (size_t)sprintf(keyhex[n] + o, "%02x",
+                                   (unsigned char)keys[n].str_val.data[j]);
+            }
+          } else {
+            for (size_t j = 0; j < key_size && o + 1 < sizeof(keyhex[n]); j++) {
+              o += (size_t)sprintf(keyhex[n] + o, "%02x",
+                                   ((const unsigned char*)&keys[n])[j]);
+            }
+          }
+          keyhex[n][o] = '\0';
+          n++;
+        }
+        // Sort by key hex: map iteration order is table layout
+        // (representation); both sides sort identically.
+        int order[128];
+        for (int i = 0; i < n; i++) order[i] = i;
+        for (int a = 0; a < n; a++) {
+          for (int b = a + 1; b < n; b++) {
+            if (strcmp(keyhex[order[b]], keyhex[order[a]]) < 0) {
+              int t = order[a];
+              order[a] = order[b];
+              order[b] = t;
+            }
+          }
+        }
+        for (int a = 0; a < n; a++) {
+          if (a) printf(",");
+          int i = order[a];
+          printf("[\"%s\",", keyhex[i]);
+          if (val_is_msg) {
+            emit_msg_value(*(const upb_Message**)&vals[i], val_sub);
+          } else if (val_size == 0) {
+            printf("\"");
+            emit_hex_bytes((const unsigned char*)vals[i].str_val.data,
+                           vals[i].str_val.size);
+            printf("\"");
+          } else {
+            printf("\"");
+            emit_hex_bytes((const unsigned char*)&vals[i], val_size);
+            printf("\"");
+          }
+          printf("]");
+        }
+      }
+      printf("]}");
+      continue;
+    }
     if (is_array) {
       if (!first_emitted) printf(",");
       first_emitted = 0;

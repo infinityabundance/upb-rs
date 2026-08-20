@@ -1,20 +1,22 @@
 //! Known-field message decoding with real mini tables, including linked
-//! sub-messages.
+//! sub-messages and maps.
 //!
 //! Mirrors the pinned upstream `upb/wire/decode.c` observable behavior for
-//! the surface supported by courts `decode-known-v1` and `decode-submsg-v1`:
-//! scalar fields of all varint/fixed/floating types, string/bytes, repeated
-//! scalars (unpacked and packed), repeated strings/bytes, oneofs, and
-//! sub-messages (singular with merge semantics, repeated, nested, and
-//! recursive through the pool's sub-slot links). Maps, groups, and closed
-//! enums are deferred; the corpus generators never emit them, and the
-//! decoder rejects groups/maps defensively.
+//! the surface supported by courts `decode-known-v1`, `decode-submsg-v1`,
+//! and the Phase-2 map corpus: scalar fields of all varint/fixed/floating
+//! types, string/bytes, repeated scalars (unpacked and packed), repeated
+//! strings/bytes, oneofs, sub-messages (singular with merge semantics,
+//! repeated, nested, and recursive through the pool's sub-slot links), and
+//! map fields (`_upb_Decoder_DecodeToMap`, decode.c:474-535) whose entries
+//! are linked map-entry mini tables. Groups and closed enums are deferred;
+//! the corpus generators never emit them, and the decoder rejects groups
+//! defensively.
 //!
 //! The message is modeled exactly like upstream: a zeroed byte buffer of
 //! `mini_table.size` bytes with presence bits at their hasbit indices, scalar
 //! values at their offsets, and oneof case words at the negated presence
-//! offsets. Strings/bytes content, arrays, and sub-messages live in side
-//! storage (their wire observable is the content, not the pointer).
+//! offsets. Strings/bytes content, arrays, sub-messages, and maps live in
+//! side storage (their wire observable is the content, not the pointer).
 //!
 //! Key upstream semantics reproduced (all cited to `upb/wire/decode.c` at the
 //! pinned commit):
@@ -75,8 +77,25 @@ impl std::fmt::Display for KnownDecodeError {
 
 type Result<T> = std::result::Result<T, KnownDecodeError>;
 
+/// A decoded map entry (the wire observable of `upb_Map` content). The key is
+/// the raw bytes (string keys store the string bytes); the value is either
+/// raw scalar/string bytes or a decoded sub-message.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MapEntry {
+    pub key: Vec<u8>,
+    pub value: MapValue,
+}
+
+/// A map value: scalar/string bytes, or a sub-message (boxed — the enum
+/// lives in per-map entry storage).
+#[derive(Debug, Clone, PartialEq)]
+pub enum MapValue {
+    Scalar(Vec<u8>),
+    Message(Box<Message>),
+}
+
 /// A decoded message.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Message {
     /// The zeroed storage buffer (mini_table.size bytes).
     pub buf: Vec<u8>,
@@ -88,6 +107,9 @@ pub struct Message {
     pub submsgs: HashMap<usize, Message>,
     /// Repeated submessage elements by field number.
     pub submsg_arrays: HashMap<usize, Vec<Message>>,
+    /// Map fields by field number: entries in insertion order (the map's
+    /// internal table order is representation; the dump sorts).
+    pub maps: HashMap<usize, Vec<MapEntry>>,
     /// Concatenated unknown-field wire bytes, in wire order.
     pub unknown: Vec<u8>,
 }
@@ -100,6 +122,7 @@ impl Message {
             arrays: HashMap::new(),
             submsgs: HashMap::new(),
             submsg_arrays: HashMap::new(),
+            maps: HashMap::new(),
             unknown: Vec::new(),
         }
     }
@@ -191,6 +214,27 @@ impl TableSet {
                 .map_err(|_| KnownDecodeError::Unsupported("minitable"))?;
             tables.push(mt);
         }
+        // `upb_MiniTable_SetSubMessage` (mini_descriptor/link.c:43-60):
+        // linking a field to a map-entry table (ext & kUpb_ExtMode_IsMapEntry)
+        // flips the field's mode bits to kUpb_FieldMode_Map (0). The slot
+        // order is field order (the same walk `sub()` uses).
+        for t in 0..tables.len() {
+            let mut slot = 0usize;
+            for i in 0..tables[t].fields.len() {
+                if tables[t].fields[i].submsg_ofs == NO_SUB {
+                    continue;
+                }
+                let target = links.get(t).and_then(|l| l.get(slot)).copied();
+                slot += 1;
+                if let Some(target) = target {
+                    if target < tables.len()
+                        && tables[target].ext & upb_rs_mini_table::model::EXT_MAP_ENTRY != 0
+                    {
+                        tables[t].fields[i].mode &= !0x3; // kUpb_FieldMode_Map == 0
+                    }
+                }
+            }
+        }
         Ok(TableSet {
             tables,
             links: links.iter().map(|l| l.to_vec()).collect(),
@@ -264,6 +308,39 @@ impl Message {
             }
             let is_submsg = f.descriptortype == 11 && f.submsg_ofs != NO_SUB;
             let subl = ts.sub(table_idx, i);
+            if f.mode_class() == FieldMode::Map {
+                // Map fields carry no presence; render the content (empty
+                // list when the map never appeared), mirroring the oracle
+                // dump. Both sides sort entries by key hex: upstream
+                // iteration order is table layout (representation).
+                let entries = self
+                    .maps
+                    .get(&(f.number as usize))
+                    .cloned()
+                    .unwrap_or_default();
+                let val_sub = ts.sub(table_idx, i).and_then(|e| ts.sub(e, 1));
+                let mut rendered: Vec<serde_json::Value> = entries
+                    .iter()
+                    .map(|e| {
+                        let key = serde_json::Value::String(hex(&e.key));
+                        let val = match &e.value {
+                            MapValue::Scalar(bytes) => serde_json::Value::String(hex(bytes)),
+                            MapValue::Message(m) => match val_sub {
+                                Some(s) => m.dump(ts, s),
+                                None => empty_dump(),
+                            },
+                        };
+                        serde_json::json!([key, val])
+                    })
+                    .collect();
+                rendered.sort_by(|a, b| {
+                    let ka = a[0].as_str().unwrap_or("");
+                    let kb = b[0].as_str().unwrap_or("");
+                    ka.cmp(kb)
+                });
+                fields.push(serde_json::json!({"number": f.number, "value": rendered}));
+                continue;
+            }
             if f.mode_class() == FieldMode::Array {
                 if is_submsg {
                     let elems = self
@@ -437,9 +514,6 @@ fn reject_deferred(mt: &MiniTable) -> Result<()> {
     for f in &mt.fields {
         if f.descriptortype == 10 {
             return Err(KnownDecodeError::Unsupported("group"));
-        }
-        if f.mode_class() == FieldMode::Map {
-            return Err(KnownDecodeError::Unsupported("map"));
         }
     }
     Ok(())
@@ -632,6 +706,66 @@ fn decode_message(
                     stream.pop_limit(*ptr, delta);
                 }
             }
+            Op::Map => {
+                // `_upb_Decoder_DecodeToMap` (decode.c:474-535).
+                let size = value.expect("delimited size") as usize;
+                let field_index = field_index.expect("map field");
+                let entry_idx = ts
+                    .sub(table_idx, field_index)
+                    .expect("Map op implies a linked map-entry table");
+                let entry_mt = ts.table(entry_idx);
+                debug_assert_eq!(entry_mt.fields.len(), 2);
+                let key_size = map_size_for_fieldtype(entry_mt.fields[0].descriptortype) as usize;
+                let val_size = map_size_for_fieldtype(entry_mt.fields[1].descriptortype) as usize;
+                // Parse the map entry as a sub-message (`_upb_Decoder_DecodeSubMessage`
+                // into the stack `upb_MapEntry`, decode.c:494-514).
+                let mut ent = Message::new(entry_mt.size as usize);
+                let delta = stream.push_limit(*ptr, size);
+                if depth - 1 < 0 {
+                    return Err(KnownDecodeError::MaxDepthExceeded);
+                }
+                decode_message(ts, entry_idx, &mut ent, stream, ptr, depth - 1, input)?;
+                stream.pop_limit(*ptr, delta);
+                if !ent.unknown.is_empty() {
+                    // `_upb_Encoder_AddMapEntryUnknown`
+                    // (internal/encoder.c:48-68): the whole entry is
+                    // re-encoded (present fields + the entry's own unknowns)
+                    // and stored as an unknown field of the parent under the
+                    // map field's tag.
+                    let payload = encode_map_entry(&ent, ts, entry_idx);
+                    let mut seg = Vec::with_capacity(payload.len() + 10);
+                    encode_varint(&mut seg, ((f.number as u64) << 3) | 2);
+                    encode_varint(&mut seg, payload.len() as u64);
+                    seg.extend(payload);
+                    msg.unknown.extend(seg);
+                } else {
+                    let key = entry_field_bytes(&ent, entry_mt, 0, key_size);
+                    let value = if entry_mt.fields[1].descriptortype == 11 {
+                        // The value is a sub-message; upstream creates the
+                        // sub-message proactively (decode.c:508-512) so an
+                        // absent value field is an empty message.
+                        let sub_size = ts
+                            .sub(entry_idx, 1)
+                            .map(|t| ts.table(t).size as usize)
+                            .unwrap_or(0);
+                        MapValue::Message(
+                            ent.submsgs
+                                .remove(&2)
+                                .map(Box::new)
+                                .unwrap_or_else(|| Box::new(Message::new(sub_size))),
+                        )
+                    } else {
+                        MapValue::Scalar(entry_field_bytes(&ent, entry_mt, 1, val_size))
+                    };
+                    let entries = msg.maps.entry(f.number as usize).or_default();
+                    // `_upb_Map_Insert` is last-wins for duplicate keys.
+                    if let Some(existing) = entries.iter_mut().find(|e| e.key == key) {
+                        existing.value = value;
+                    } else {
+                        entries.push(MapEntry { key, value });
+                    }
+                }
+            }
             Op::Unknown => unreachable!(),
         }
     }
@@ -646,6 +780,7 @@ enum Op {
     String,
     Bytes,
     SubMessage,
+    Map,
     VarintPacked(usize),
     FixedPacked(usize),
     Unknown,
@@ -722,11 +857,19 @@ fn scalar_op(field: &MiniTableField) -> Op {
 /// `_upb_Decoder_GetDelimitedOp` (decode.c:811-872) for the supported surface.
 /// Message fields dispatch to SubMessage only when their sub-slot is linked;
 /// unlinked sub-tables decode as unknown (`_upb_Decoder_CheckUnlinked`,
-/// decode.c:805-812).
+/// decode.c:805-812). A field in Map mode (mode & 3 == 0) dispatches to Map
+/// when its map-entry sub is linked.
 fn delimited_op(ts: &TableSet, table_idx: usize, field_index: usize) -> Op {
     let field = &ts.table(table_idx).fields[field_index];
-    if field.mode_class() == FieldMode::Array {
-        match field.descriptortype {
+    match field.mode_class() {
+        FieldMode::Map => {
+            if ts.sub(table_idx, field_index).is_some() {
+                Op::Map
+            } else {
+                Op::Unknown
+            }
+        }
+        FieldMode::Array => match field.descriptortype {
             9 => Op::String,
             12 => Op::Bytes,
             11 if ts.sub(table_idx, field_index).is_some() => Op::SubMessage,
@@ -736,14 +879,13 @@ fn delimited_op(ts: &TableSet, table_idx: usize, field_index: usize) -> Op {
                 Op::FixedPacked(elem_size(t).trailing_zeros() as usize)
             }
             _ => Op::Unknown,
-        }
-    } else {
-        match field.descriptortype {
+        },
+        FieldMode::Scalar => match field.descriptortype {
             9 => Op::String,
             12 => Op::Bytes,
             11 if ts.sub(table_idx, field_index).is_some() => Op::SubMessage,
             _ => Op::Unknown,
-        }
+        },
     }
 }
 
@@ -919,6 +1061,342 @@ fn decode_unknown_field(
         msg.unknown.extend_from_slice(&input[abs_start..abs_end]);
     }
     Ok(end)
+}
+
+// ---------------------------------------------------------------------------
+// Map fields
+//
+// `_upb_Decoder_DecodeToMap` (decode.c:474-535): the map-entry table's
+// key/value field TYPES select the storage sizes (`kSizeInMap`, decode.c:
+// 436-458); entries parse as sub-messages and insert last-wins; entries with
+// unknown fields are re-encoded wholesale into the parent's unknowns
+// (`_upb_Encoder_AddMapEntryUnknown`, internal/encoder.c:48-68).
+// ---------------------------------------------------------------------------
+
+/// `kSizeInMap` (decode.c:436-458): the `upb_Map` key/value size for a
+/// field type; 0 = string-typed.
+fn map_size_for_fieldtype(t: u8) -> u8 {
+    match t {
+        1 | 6 | 16 => 8,       // Double, Fixed64, SFixed64
+        2 | 7 | 15 => 4,       // Float, Fixed32, SFixed32
+        3 | 4 => 8,            // Int64, UInt64
+        5 | 13 | 14 | 17 => 4, // Int32, UInt32, Enum, SInt32
+        8 => 1,                // Bool
+        9 | 12 => 0,           // String, Bytes -> string type
+        10 | 11 => 8,          // Group, Message -> pointer
+        18 => 8,               // SInt64
+        _ => 0,
+    }
+}
+
+/// The stored key/value bytes of a parsed entry, for the map insert. Absent
+/// numeric fields read the zeroed buffer; absent strings read empty —
+/// matching the memset-zeroed `upb_MapEntry` key/value unions (map_entry.h:
+/// 24-39) that `_upb_Map_Insert` copies from.
+fn entry_field_bytes(
+    ent: &Message,
+    entry_mt: &MiniTable,
+    field_idx: usize,
+    size: usize,
+) -> Vec<u8> {
+    let f = &entry_mt.fields[field_idx];
+    match f.descriptortype {
+        9 | 12 => ent
+            .strings
+            .get(&(f.number as usize))
+            .cloned()
+            .unwrap_or_default(),
+        _ => {
+            let off = f.offset as usize;
+            if off + size <= ent.buf.len() {
+                ent.buf[off..off + size].to_vec()
+            } else {
+                vec![0; size]
+            }
+        }
+    }
+}
+
+/// `upb_Encoder_EncodeVarint32/64`-equivalent: the minimal varint form.
+fn encode_varint(out: &mut Vec<u8>, mut v: u64) {
+    while v >= 0x80 {
+        out.push(((v as u8) & 0x7f) | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+/// `encode_zz32` / `encode_zz64` (internal/encoder.c:70-77): the zigzag
+/// ENCODE direction (the decode munge is the inverse, see `zigzag32/64`).
+fn zigzag_encode_32(v: i32) -> u64 {
+    ((v << 1) ^ (v >> 31)) as u32 as u64
+}
+
+fn zigzag_encode_64(v: i64) -> u64 {
+    ((v << 1) ^ (v >> 63)) as u64
+}
+
+/// The wire type used to encode a field of the given type.
+fn wire_type_for(t: u8) -> u64 {
+    match t {
+        t if is_varint_type(t) => 0,
+        t if is_fixed32_type(t) => 5,
+        t if is_fixed64_type(t) => 1,
+        _ => 2, // String, Bytes, Message
+    }
+}
+
+/// Encodes one scalar value (varint/fixed/bool) from its stored LE bytes
+/// into `out`. Sign-extension and zigzag re-encode mirror internal/encoder.c
+/// (`encode_zz32/64`; Int32/Enum as int32 sign-extended to a 64-bit varint;
+/// UInt32 as u32; Int64/UInt64 as the stored 64-bit word).
+fn encode_scalar(out: &mut Vec<u8>, t: u8, raw: &[u8]) {
+    match t {
+        8 => encode_varint(out, raw.first().copied().unwrap_or(0) as u64),
+        t if is_varint_type(t) => {
+            let v = match t {
+                17 => zigzag_encode_32(i32::from_le_bytes(
+                    raw[..4].try_into().expect("4 stored bytes"),
+                )),
+                18 => zigzag_encode_64(i64::from_le_bytes(
+                    raw[..8].try_into().expect("8 stored bytes"),
+                )),
+                3 | 4 => u64::from_le_bytes(raw[..8].try_into().expect("8 stored bytes")),
+                5 | 14 => {
+                    (u32::from_le_bytes(raw[..4].try_into().expect("4 stored bytes")) as i32) as i64
+                        as u64
+                }
+                13 => u32::from_le_bytes(raw[..4].try_into().expect("4 stored bytes")) as u64,
+                _ => unreachable!("varint scalar type {t}"),
+            };
+            encode_varint(out, v);
+        }
+        t if is_fixed32_type(t) => out.extend_from_slice(&raw[..4]),
+        t if is_fixed64_type(t) => out.extend_from_slice(&raw[..8]),
+        _ => unreachable!("scalar type {t}"),
+    }
+}
+
+/// `_upb_Encoder_AddMapEntryUnknown` payload: the exact re-encode of a parsed
+/// map entry — present fields in field-number order, then the entry's own
+/// unknown bytes in wire order (internal/encoder.c:48-68).
+fn encode_map_entry(ent: &Message, ts: &TableSet, entry_idx: usize) -> Vec<u8> {
+    let mt = ts.table(entry_idx);
+    let mut out = Vec::new();
+    for (i, f) in mt.fields.iter().enumerate() {
+        if !ent.field_present(f) {
+            continue;
+        }
+        let number = f.number as u64;
+        match f.descriptortype {
+            9 | 12 => {
+                let bytes = ent
+                    .strings
+                    .get(&(f.number as usize))
+                    .cloned()
+                    .unwrap_or_default();
+                encode_varint(&mut out, (number << 3) | 2);
+                encode_varint(&mut out, bytes.len() as u64);
+                out.extend(bytes);
+            }
+            11 => {
+                let payload = match ts.sub(entry_idx, i) {
+                    Some(s) => ent
+                        .submsgs
+                        .get(&(f.number as usize))
+                        .map(|m| encode_message(m, ts, s))
+                        .unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                encode_varint(&mut out, (number << 3) | 2);
+                encode_varint(&mut out, payload.len() as u64);
+                out.extend(payload);
+            }
+            10 => unreachable!("groups cannot be map entry fields"),
+            t if is_varint_type(t) || is_fixed32_type(t) || is_fixed64_type(t) => {
+                let n = scalar_width(f);
+                let off = f.offset as usize;
+                let raw = if off + n <= ent.buf.len() {
+                    ent.buf[off..off + n].to_vec()
+                } else {
+                    vec![0; n]
+                };
+                encode_varint(&mut out, (number << 3) | wire_type_for(t));
+                encode_scalar(&mut out, t, &raw);
+            }
+            _ => unreachable!("map entry field type {}", f.descriptortype),
+        }
+    }
+    out.extend(&ent.unknown);
+    out
+}
+
+/// The wire form of one stored map entry: key field (1) then value field (2),
+/// both always present (the map only stores inserted entries).
+fn encode_map_entry_content(
+    e: &MapEntry,
+    ts: &TableSet,
+    table_idx: usize,
+    field_idx: usize,
+) -> Vec<u8> {
+    let entry_idx = ts.sub(table_idx, field_idx).expect("map entry linked");
+    let entry_mt = ts.table(entry_idx);
+    let key_f = &entry_mt.fields[0];
+    let val_f = &entry_mt.fields[1];
+    let mut out = Vec::new();
+    encode_varint(&mut out, (1u64 << 3) | wire_type_for(key_f.descriptortype));
+    match key_f.descriptortype {
+        9 | 12 => {
+            encode_varint(&mut out, e.key.len() as u64);
+            out.extend(&e.key);
+        }
+        _ => encode_scalar(&mut out, key_f.descriptortype, &e.key),
+    }
+    encode_varint(&mut out, (2u64 << 3) | wire_type_for(val_f.descriptortype));
+    match &e.value {
+        MapValue::Scalar(bytes) => match val_f.descriptortype {
+            9 | 12 => {
+                encode_varint(&mut out, bytes.len() as u64);
+                out.extend(bytes);
+            }
+            _ => encode_scalar(&mut out, val_f.descriptortype, bytes),
+        },
+        MapValue::Message(m) => {
+            let payload = ts
+                .sub(entry_idx, 1)
+                .map(|s| encode_message(m, ts, s))
+                .unwrap_or_default();
+            encode_varint(&mut out, payload.len() as u64);
+            out.extend(payload);
+        }
+    }
+    out
+}
+
+/// `_upb_Encode` for the supported surface: present fields in mini-table
+/// (field-number) order, then the message's unknown bytes in wire order.
+/// Presence follows `field_present`: hasbit fields only when set, oneof
+/// members only when their case matches, presence-less (proto3-singular)
+/// fields always (stored value, 0 when never written).
+fn encode_message(msg: &Message, ts: &TableSet, table_idx: usize) -> Vec<u8> {
+    let mt = ts.table(table_idx);
+    let mut out = Vec::new();
+    for (i, f) in mt.fields.iter().enumerate() {
+        let number = f.number as u64;
+        match f.mode_class() {
+            FieldMode::Map => {
+                if let Some(entries) = msg.maps.get(&(f.number as usize)) {
+                    for e in entries {
+                        out.extend(encode_map_entry_content(e, ts, table_idx, i));
+                    }
+                }
+            }
+            FieldMode::Array => match f.descriptortype {
+                9 | 12 => {
+                    if let Some(elems) = msg.arrays.get(&(f.number as usize)) {
+                        for e in elems {
+                            encode_varint(&mut out, (number << 3) | 2);
+                            encode_varint(&mut out, e.len() as u64);
+                            out.extend(e);
+                        }
+                    }
+                }
+                11 => {
+                    if let Some(elems) = msg.submsg_arrays.get(&(f.number as usize)) {
+                        let sub = ts.sub(table_idx, i);
+                        for e in elems {
+                            let payload = sub.map(|s| encode_message(e, ts, s)).unwrap_or_default();
+                            encode_varint(&mut out, (number << 3) | 2);
+                            encode_varint(&mut out, payload.len() as u64);
+                            out.extend(payload);
+                        }
+                    }
+                }
+                t if is_varint_type(t) => {
+                    if let Some(elems) = msg.arrays.get(&(f.number as usize)) {
+                        if f.is_packed() {
+                            let mut body = Vec::new();
+                            for e in elems {
+                                encode_scalar(&mut body, t, e);
+                            }
+                            encode_varint(&mut out, (number << 3) | 2);
+                            encode_varint(&mut out, body.len() as u64);
+                            out.extend(body);
+                        } else {
+                            for e in elems {
+                                encode_varint(&mut out, number << 3);
+                                encode_scalar(&mut out, t, e);
+                            }
+                        }
+                    }
+                }
+                t if is_fixed32_type(t) || is_fixed64_type(t) => {
+                    if let Some(elems) = msg.arrays.get(&(f.number as usize)) {
+                        if f.is_packed() {
+                            let mut body = Vec::new();
+                            for e in elems {
+                                encode_scalar(&mut body, t, e);
+                            }
+                            encode_varint(&mut out, (number << 3) | 2);
+                            encode_varint(&mut out, body.len() as u64);
+                            out.extend(body);
+                        } else {
+                            for e in elems {
+                                encode_varint(&mut out, (number << 3) | wire_type_for(t));
+                                encode_scalar(&mut out, t, e);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            },
+            FieldMode::Scalar => {
+                if !msg.field_present(f) {
+                    continue;
+                }
+                match f.descriptortype {
+                    9 | 12 => {
+                        let bytes = msg
+                            .strings
+                            .get(&(f.number as usize))
+                            .cloned()
+                            .unwrap_or_default();
+                        encode_varint(&mut out, (number << 3) | 2);
+                        encode_varint(&mut out, bytes.len() as u64);
+                        out.extend(bytes);
+                    }
+                    11 => {
+                        let payload = match ts.sub(table_idx, i) {
+                            Some(s) => msg
+                                .submsgs
+                                .get(&(f.number as usize))
+                                .map(|m| encode_message(m, ts, s))
+                                .unwrap_or_default(),
+                            None => Vec::new(),
+                        };
+                        encode_varint(&mut out, (number << 3) | 2);
+                        encode_varint(&mut out, payload.len() as u64);
+                        out.extend(payload);
+                    }
+                    10 => { /* groups deferred */ }
+                    t if is_varint_type(t) || is_fixed32_type(t) || is_fixed64_type(t) => {
+                        let n = scalar_width(f);
+                        let off = f.offset as usize;
+                        let raw = if off + n <= msg.buf.len() {
+                            msg.buf[off..off + n].to_vec()
+                        } else {
+                            vec![0; n]
+                        };
+                        encode_varint(&mut out, (number << 3) | wire_type_for(t));
+                        encode_scalar(&mut out, t, &raw);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    out.extend(&msg.unknown);
+    out
 }
 
 #[cfg(test)]
@@ -1305,5 +1783,124 @@ mod tests {
         assert_eq!(m.oneof_case(8), 1);
         let sub = m.submsgs.get(&1).expect("b");
         assert_eq!(sub.buf[12..16], [2, 0, 0, 0]); // merged x = 2, not replaced
+    }
+
+    /// A { map<uint32,int32> m = 1; } ($3) with a linked map entry (%)( =
+    /// UInt32 key, Int32 val). Entries insert; duplicate keys are last-wins;
+    /// an empty entry inserts the zero key/value (oracle-verified).
+    #[test]
+    fn map_basic_insert_last_wins_empty() {
+        let m = dsub(
+            &["2433", "252928"],
+            &[&[1], &[]],
+            &[
+                0x0A, 0x04, 0x08, 0x05, 0x10, 0x07, // {key:5, val:7}
+                0x0A, 0x00, // empty entry -> {0, 0}
+                0x0A, 0x04, 0x08, 0x05, 0x10, 0x02, // {key:5, val:2} (replaces)
+            ],
+            100,
+        )
+        .unwrap();
+        let entries = m.maps.get(&1).expect("map field 1");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].key, 5u32.to_le_bytes());
+        assert_eq!(entries[1].key, 0u32.to_le_bytes());
+        match &entries[0].value {
+            MapValue::Scalar(v) => assert_eq!(v, &2i32.to_le_bytes()),
+            _ => panic!("scalar value"),
+        }
+    }
+
+    /// String keys: the entry's String key decodes into the entry message's
+    /// side storage and becomes the map key bytes (oracle-verified `%1)`).
+    #[test]
+    fn map_string_keys() {
+        let m = dsub(
+            &["2433", "253129"],
+            &[&[1], &[]],
+            &[
+                0x0A, 0x09, 0x0A, 0x05, b'h', b'e', b'l', b'l', b'o', 0x10, 0x01,
+            ],
+            100,
+        )
+        .unwrap();
+        let entries = m.maps.get(&1).expect("map field 1");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key, b"hello");
+        match &entries[0].value {
+            MapValue::Scalar(v) => assert_eq!(v, &1u32.to_le_bytes()),
+            _ => panic!("scalar value"),
+        }
+    }
+
+    /// Message values: the entry's value field decodes as a linked
+    /// sub-message; an absent value field yields an empty message
+    /// (oracle-verified `%)3` with the value table `$)`).
+    #[test]
+    fn map_message_values() {
+        let m = dsub(
+            &["2433", "252933", "2429"],
+            &[&[1], &[2], &[]],
+            &[0x0A, 0x06, 0x08, 0x05, 0x12, 0x02, 0x08, 0x01],
+            100,
+        )
+        .unwrap();
+        let entries = m.maps.get(&1).expect("map field 1");
+        assert_eq!(entries.len(), 1);
+        match &entries[0].value {
+            MapValue::Message(s) => {
+                assert_eq!(s.buf[12..16], 1u32.to_le_bytes()); // x = 1
+            }
+            _ => panic!("message value"),
+        }
+    }
+
+    /// An entry with an unknown field is NOT inserted; the whole entry is
+    /// re-encoded (present fields + the entry's unknowns) and appended to the
+    /// parent's unknowns under the map field's tag (oracle-verified
+    /// `0a0708051d00000000` -> unknown `0a0708051d00000000`).
+    #[test]
+    fn map_entry_unknown_adds_reencoded_entry() {
+        let m = dsub(
+            &["2433", "252928"],
+            &[&[1], &[]],
+            &[
+                0x0A, 0x07, 0x08, 0x05, // key:5
+                0x1D, 0x00, 0x00, 0x00, 0x00, // unknown field 3 fixed32
+            ],
+            100,
+        )
+        .unwrap();
+        assert!(!m.maps.contains_key(&1));
+        assert_eq!(
+            m.unknown,
+            [0x0A, 0x07, 0x08, 0x05, 0x1D, 0x00, 0x00, 0x00, 0x00]
+        );
+    }
+
+    /// A non-delimited wire type for a map field decodes as an unknown field.
+    #[test]
+    fn map_wrong_wire_type_is_unknown() {
+        let m = dsub(
+            &["2433", "252928"],
+            &[&[1], &[]],
+            &[0x08, 0x01], // varint tag for field 1
+            100,
+        )
+        .unwrap();
+        assert!(!m.maps.contains_key(&1));
+        assert_eq!(m.unknown, [0x08, 0x01]);
+    }
+
+    /// A truncated entry payload is malformed (PushLimit overrun).
+    #[test]
+    fn map_truncated_entry_malformed() {
+        let e = dsub(
+            &["2433", "252928"],
+            &[&[1], &[]],
+            &[0x0A, 0x03, 0x08, 0x05, 0x10], // val varint truncated
+            100,
+        );
+        assert!(matches!(e, Err(KnownDecodeError::Malformed)));
     }
 }

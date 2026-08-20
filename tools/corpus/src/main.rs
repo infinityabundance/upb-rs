@@ -1547,6 +1547,297 @@ fn gen_decode_submsg_corpus(set: &mut CaseSet) {
             "sm-5byte-size-zero",
         );
     }
+    // Map fields (`_upb_Decoder_DecodeToMap`): a parent with one Message
+    // field linked to a map-entry table (mode flips to kUpb_FieldMode_Map at
+    // link time). Entry wire bytes: key field 1, value field 2.
+    {
+        // A { map<uint32,int32> m = 1; } = $3 + map entry %)( (UInt32 key,
+        // Int32 val). Entry payloads use tag 0x0A (field 1, delimited).
+        let mds = vec![md_fields(&[(1, 17)]), map_descriptor(7, 6)];
+        let links = vec![vec![1], vec![]];
+        set.push_submsg(&mds, &links, &[], "mp-empty");
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x04, 0x08, 0x05, 0x10, 0x07],
+            "mp-one",
+        );
+        set.push_submsg(
+            &mds,
+            &links,
+            &[
+                0x0A, 0x04, 0x08, 0x05, 0x10, 0x07, 0x0A, 0x04, 0x08, 0x02, 0x10, 0x02,
+            ],
+            "mp-two",
+        );
+        // Duplicate keys: last-wins (one entry).
+        set.push_submsg(
+            &mds,
+            &links,
+            &[
+                0x0A, 0x04, 0x08, 0x05, 0x10, 0x07, 0x0A, 0x04, 0x08, 0x05, 0x10, 0x02,
+            ],
+            "mp-dup-last-wins",
+        );
+        // Empty entry inserts the zero key/value; empty then populated.
+        set.push_submsg(&mds, &links, &[0x0A, 0x00], "mp-empty-entry");
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x00, 0x0A, 0x04, 0x08, 0x05, 0x10, 0x07],
+            "mp-empty-then-one",
+        );
+        // Val-only (zero key) and key-only (zero val).
+        set.push_submsg(&mds, &links, &[0x0A, 0x03, 0x10, 0x80, 0x07], "mp-val-only");
+        set.push_submsg(&mds, &links, &[0x0A, 0x02, 0x08, 0x05], "mp-key-only");
+        // Negative int32 key/value: 10-byte sign-extended varints on the
+        // wire; the map stores the munged low-32 bits.
+        set.push_submsg(
+            &mds,
+            &links,
+            &[
+                0x0A, 0x0C, 0x08, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x10,
+                0x01,
+            ],
+            "mp-negative-key",
+        );
+        // Entries with unknown fields are NOT inserted; the whole entry is
+        // re-encoded under the map field's tag (AddMapEntryUnknown).
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x05, 0x1D, 0x00, 0x00, 0x00, 0x00],
+            "mp-unknown-entry",
+        );
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x07, 0x08, 0x05, 0x1D, 0x00, 0x00, 0x00, 0x00],
+            "mp-unknown-with-key",
+        );
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x03, 0x18, 0x03],
+            "mp-unknown-varint-entry",
+        );
+        // Key field on the wire with a mismatched wire type (delimited key):
+        // the entry gains an unknown, so the whole entry is re-encoded.
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x04, 0x0A, 0x02, 0x05, 0x00],
+            "mp-key-wire-mismatch",
+        );
+        // Field number 0 inside an entry is malformed.
+        set.push_submsg(&mds, &links, &[0x0A, 0x01, 0x00], "mp-entry-field0");
+        // Malformed entries.
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x03, 0x08, 0x05, 0x10],
+            "mp-trunc-varint",
+        );
+        set.push_submsg(&mds, &links, &[0x0A, 0x05, 0x08, 0x05], "mp-size-overrun");
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0xFE, 0xFF, 0xFF, 0xFF, 0x07],
+            "mp-huge-size",
+        );
+        // Wrong wire types for the map field itself -> unknown fields.
+        set.push_submsg(&mds, &links, &[0x08, 0x01], "mp-wrong-wire-varint");
+        set.push_submsg(&mds, &links, &[0x0B, 0x0C], "mp-wrong-wire-group");
+        // Truncations at every offset of a two-entry payload.
+        let full = [
+            0x0A, 0x04, 0x08, 0x05, 0x10, 0x07, 0x0A, 0x04, 0x08, 0x02, 0x10, 0x02,
+        ];
+        push_truncations(set, &mds, &links, &full, "mp-two");
+    }
+    // String keys and values (%1) = String key + UInt32 val; %)1 = UInt32
+    // key + String val; %11 = String/String).
+    {
+        let mds = vec![md_fields(&[(1, 17)]), map_descriptor(15, 7)];
+        let links = vec![vec![1], vec![]];
+        set.push_submsg(
+            &mds,
+            &links,
+            &[
+                0x0A, 0x09, 0x0A, 0x05, b'h', b'e', b'l', b'l', b'o', 0x10, 0x01,
+            ],
+            "mp-str-key",
+        );
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x04, 0x0A, 0x00, 0x10, 0x01],
+            "mp-str-key-empty",
+        );
+        set.push_submsg(
+            &mds,
+            &links,
+            &[
+                0x0A, 0x09, 0x0A, 0x02, b'h', b'i', 0x1D, 0x00, 0x00, 0x00, 0x00,
+            ],
+            "mp-str-key-unknown",
+        );
+    }
+    {
+        let mds = vec![md_fields(&[(1, 17)]), map_descriptor(7, 15)];
+        let links = vec![vec![1], vec![]];
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x05, 0x08, 0x05, 0x12, 0x01, b'x'],
+            "mp-str-val",
+        );
+    }
+    {
+        let mds = vec![md_fields(&[(1, 17)]), map_descriptor(15, 15)];
+        let links = vec![vec![1], vec![]];
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x06, 0x0A, 0x01, b'x', 0x12, 0x01, b'y'],
+            "mp-str-both",
+        );
+    }
+    // Other scalar key types: Bool (/), SInt32 (*), SInt64 (-), Int64 (+),
+    // UInt64 (,). Negative keys exercise sign extension / zigzag munge.
+    {
+        let mds = vec![md_fields(&[(1, 17)]), map_descriptor(13, 7)];
+        let links = vec![vec![1], vec![]];
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x04, 0x08, 0x01, 0x10, 0x05],
+            "mp-bool-key",
+        );
+    }
+    {
+        let mds = vec![md_fields(&[(1, 17)]), map_descriptor(8, 7)];
+        let links = vec![vec![1], vec![]];
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x04, 0x08, 0x01, 0x10, 0x02],
+            "mp-sint32-key",
+        );
+    }
+    {
+        let mds = vec![md_fields(&[(1, 17)]), map_descriptor(11, 7)];
+        let links = vec![vec![1], vec![]];
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x04, 0x08, 0x01, 0x10, 0x02],
+            "mp-sint64-key",
+        );
+    }
+    {
+        let mds = vec![md_fields(&[(1, 17)]), map_descriptor(9, 7)];
+        let links = vec![vec![1], vec![]];
+        set.push_submsg(
+            &mds,
+            &links,
+            &[
+                0x0A, 0x0C, 0x08, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x10,
+                0x01,
+            ],
+            "mp-int64-negative-key",
+        );
+    }
+    {
+        let mds = vec![md_fields(&[(1, 17)]), map_descriptor(10, 7)];
+        let links = vec![vec![1], vec![]];
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x07, 0x08, 0x80, 0x80, 0x80, 0x80, 0x10, 0x10, 0x01],
+            "mp-uint64-key",
+        );
+    }
+    // Message values: entry val field linked to a scalar message table
+    // (A { map<uint32, B> m = 1; } where B { uint32 x = 1; }).
+    {
+        let mds = vec![
+            md_fields(&[(1, 17)]),
+            map_descriptor(7, 17),
+            md_fields(&[(1, 7)]),
+        ];
+        let links = vec![vec![1], vec![2], vec![]];
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x06, 0x08, 0x05, 0x12, 0x02, 0x08, 0x01],
+            "mp-msg-val",
+        );
+        // Absent value field: the entry inserts an empty message value.
+        set.push_submsg(&mds, &links, &[0x0A, 0x02, 0x08, 0x05], "mp-msg-val-absent");
+        // Value sub-message with its own unknown: the ENTRY has no unknowns,
+        // so it inserts; the value keeps its unknown.
+        set.push_submsg(
+            &mds,
+            &links,
+            &[
+                0x0A, 0x09, 0x08, 0x05, 0x12, 0x05, 0x1D, 0x00, 0x00, 0x00, 0x00,
+            ],
+            "mp-msg-val-unknown-inside",
+        );
+        // Nested map: the value message itself contains a map (its own entry
+        // table). A { map<uint32, B> m = 1; } B { map<uint32,int32> n = 1; }.
+        let mds = vec![
+            md_fields(&[(1, 17)]),
+            map_descriptor(7, 17),
+            md_fields(&[(1, 17)]),
+            map_descriptor(7, 6),
+        ];
+        let links = vec![vec![1], vec![2], vec![3], vec![]];
+        set.push_submsg(
+            &mds,
+            &links,
+            &[
+                0x0A, 0x0A, 0x08, 0x05, 0x12, 0x06, 0x0A, 0x04, 0x08, 0x01, 0x10, 0x02,
+            ],
+            "mp-nested-map",
+        );
+        // Depth boundary: depth 1 lets a map entry decode (its own depth 0),
+        // but a message VALUE inside the entry needs depth -1.
+        set.push_submsg_depth(
+            &[md_fields(&[(1, 17)]), map_descriptor(7, 6)],
+            &[vec![1], vec![]],
+            &[0x0A, 0x04, 0x08, 0x05, 0x10, 0x07],
+            1,
+            "mp-depth1-entry",
+        );
+        set.push_submsg_depth(
+            &mds,
+            &links,
+            &[0x0A, 0x06, 0x08, 0x05, 0x12, 0x02, 0x08, 0x01],
+            1,
+            "mp-depth1-msgval",
+        );
+        set.push_submsg_depth(
+            &mds,
+            &links,
+            &[
+                0x0A, 0x0A, 0x08, 0x05, 0x12, 0x06, 0x0A, 0x04, 0x08, 0x01, 0x10, 0x02,
+            ],
+            2,
+            "mp-depth2-nested",
+        );
+        // The same nested payload with a WRONG entry size (9 vs the actual
+        // 10 bytes) is malformed — the trailing byte escapes the entry limit.
+        set.push_submsg_depth(
+            &mds,
+            &links,
+            &[
+                0x0A, 0x09, 0x08, 0x05, 0x12, 0x06, 0x0A, 0x04, 0x08, 0x01, 0x10, 0x02,
+            ],
+            100,
+            "mp-nested-size-underrun",
+        );
+    }
 }
 
 fn main() {

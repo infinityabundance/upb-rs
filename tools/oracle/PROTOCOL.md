@@ -207,14 +207,20 @@ This exercises the linked sub-message decode path end-to-end: `PushLimit`/
 `PopLimit` payload bounding, depth budget decrement (`MaxDepthExceeded` at
 100/101 boundaries), merge semantics for repeated occurrences of singular
 sub-message fields, repeated sub-message elements, recursion through
-self-/mutual links, unknown fields inside sub-messages, and unlinked slots.
+self-/mutual links, unknown fields inside sub-messages, unlinked slots, and
+map fields (map-entry tables in the pool are linked like submessages;
+entries insert last-wins; entries carrying unknown fields are re-encoded
+wholesale into the parent's unknowns under the map field's tag via
+`_upb_Encoder_AddMapEntryUnknown`).
 
 The `dump` is the recursive extension of the `decode_known` dump:
 sub-message field values are nested dump objects, repeated sub-messages are
-arrays of dump objects, and each message level carries its own `oneof_cases`
-and `unknown`. `oneof_cases` lists every distinct case offset with its
-current case word (0 when unset) — presence-independent, oracle-verified
-(casefile oneof-case-word-dump).
+arrays of dump objects, map fields are arrays of `[keyhex, value]` pairs
+(message values render as nested dumps; both sides sort entries by key
+hex), and each message level carries its own `oneof_cases` and `unknown`.
+`oneof_cases` lists every distinct case offset with its current case word
+(0 when unset) — presence-independent, oracle-verified (casefile
+oneof-case-word-dump).
 
 Statuses: `ok` (with `dump`), or `error` with `code` one of `malformed`,
 `max_depth_exceeded`, `oom`, `minitable_build_failed`, `bad_hex`,
