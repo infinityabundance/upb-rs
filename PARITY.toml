@@ -59,7 +59,14 @@ status = "parity-sealed"
 oracle = "protobuf:2de70d710510ea7c5ad7ec0c72bfed7f411c7b60"
 court = "decode-known-v1"
 residuals = 0
-note = "known-field decode, declared scope: scalar fields (all varint/fixed/float types), strings/bytes, repeated scalars (unpacked + packed), repeated strings, oneofs, unknown fields, wire-type mismatches, truncations at every offset of a multi-field message. 516/516 cases equal. Deferred (corpus never emits; DUT rejects defensively): submessages, maps, groups, closed enums, UTF-8-validation modifiers, extensions."
+note = "known-field decode, declared scope: scalar fields (all varint/fixed/float types), strings/bytes, repeated scalars (unpacked + packed), repeated strings, oneofs, unknown fields, wire-type mismatches, truncations at every offset of a multi-field message. 517/517 cases equal. Deferred (corpus never emits; DUT rejects defensively): maps, groups, closed enums, UTF-8-validation modifiers, extensions."
+
+[wire.decode.submsg]
+status = "parity-sealed"
+oracle = "protobuf:2de70d710510ea7c5ad7ec0c72bfed7f411c7b60"
+court = "decode-submsg-v1"
+residuals = 0
+note = "linked sub-message decode: singular (merge semantics), repeated, nested, recursive (self- and mutual links), oneof members (switch clears, re-set merges), depth budget 99/100/101 boundaries (MaxDepthExceeded), truncations at every offset, size/budget overruns, unknown fields inside sub-messages, unlinked slots (decode as unknown), packed-inside-sub. 93/93 cases equal. Court caught and sealed the oneof-case-word dump regression (casefile oneof-case-word-dump). Deferred: maps, groups, closed enums."
 
 [wire.encode]
 status = "unmapped"

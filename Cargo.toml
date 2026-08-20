@@ -24,6 +24,7 @@ members = [
     "courts/decode-empty",
     "courts/mini-table-inspect",
     "courts/decode-known",
+    "courts/decode-submsg",
 ]
 
 [workspace.package]

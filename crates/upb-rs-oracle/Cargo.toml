@@ -1,6 +1,6 @@
 [package]
 name = "upb-rs-oracle"
-version = "0.1.2"
+version = "0.1.3"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -10,4 +10,4 @@ description = "Client for the pinned upstream upb oracle (tools/oracle), protoco
 
 [dependencies]
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["unbounded_depth"] }

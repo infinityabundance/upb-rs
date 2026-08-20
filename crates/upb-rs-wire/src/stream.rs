@@ -140,6 +140,32 @@ impl EpsCopyStream {
         (size as isize) <= available
     }
 
+    /// Mirrors `upb_EpsCopyInputStream_PushLimit`
+    /// (internal/eps_copy_input_stream.h:292-306): bounds the stream to a
+    /// `size`-byte payload starting at `ptr`. Returns the saved delta, which
+    /// the caller must pass to [`Self::pop_limit`]. When the new limit exceeds
+    /// the current one (`delta < 0`) the stream enters the error state, like
+    /// upstream — the failure surfaces at the next boundary check, not here.
+    pub fn push_limit(&mut self, ptr: usize, size: usize) -> isize {
+        let limit = size as isize + ptr as isize - self.end as isize;
+        let delta = self.limit - limit;
+        self.limit = limit;
+        if delta < 0 {
+            self.error = true;
+        }
+        delta
+    }
+
+    /// Mirrors `upb_EpsCopyInputStream_PopLimit`
+    /// (internal/eps_copy_input_stream.h:310-317): restores the previous
+    /// limit. Upstream asserts the inner decode consumed exactly the pushed
+    /// payload (`ptr - end == limit`); the debug assertion here preserves
+    /// that invariant as a modeling check.
+    pub fn pop_limit(&mut self, ptr: usize, saved_delta: isize) {
+        debug_assert!(ptr as isize - self.end as isize == self.limit);
+        self.limit += saved_delta;
+    }
+
     /// Mirrors the `upb_EpsCopyCapture_End` bounds check
     /// (`ptr - end > limit` fails); the stream position must not overrun the
     /// current limit for a capture to be valid.
@@ -215,5 +241,54 @@ mod tests {
         let mut ptr = 3; // exactly at end, overrun 0 == limit 0
         assert!(s.is_done(&mut ptr));
         assert!(!s.is_error());
+    }
+
+    #[test]
+    fn push_limit_bounds_a_payload() {
+        // 5-byte input; a submessage payload [2, 5): PushLimit(ptr=2, size=3)
+        // -> limit = 3 + 2 - 5 = 0, delta = 0. IsDone exactly at the boundary
+        // (ptr == 5) is Done without error; PopLimit restores.
+        let input = vec![0u8; 5];
+        let mut s = EpsCopyStream::init(&input);
+        let mut ptr = 2;
+        let delta = s.push_limit(ptr, 3);
+        assert_eq!(delta, 0);
+        ptr = 5;
+        assert!(s.is_done(&mut ptr));
+        assert!(!s.is_error());
+        s.pop_limit(ptr, delta);
+        assert_eq!(s.limit, 0);
+    }
+
+    #[test]
+    fn push_limit_exceeding_budget_errors() {
+        // Parent frame leaves 2 bytes at ptr; a child declaring 5 exceeds the
+        // current limit: delta < 0 sets the error state (PushLimit,
+        // eps_copy_input_stream.h:292-306), exactly like upstream. The decode
+        // aborts before PopLimit on this path (upstream longjmps), so no pop
+        // is performed here.
+        let input = vec![0u8; 5];
+        let mut s = EpsCopyStream::init(&input);
+        let ptr = 2;
+        let d1 = s.push_limit(ptr, 2); // limit = -1; delta = 0 - (-1) = 1
+        assert_eq!(d1, 1);
+        assert!(!s.is_error());
+        let d2 = s.push_limit(ptr, 5); // limit = 2; delta = -1 - 2 < 0
+        assert!(d2 < 0);
+        assert!(s.is_error());
+    }
+
+    #[test]
+    fn push_limit_inside_input() {
+        // A payload fully inside the input: limit stays positive.
+        let input = vec![0u8; 32];
+        let mut s = EpsCopyStream::init(&input);
+        let mut ptr = 4;
+        let delta = s.push_limit(ptr, 8); // limit = 8 + 4 - 16 = -4; delta = 16 - (-4) = 20
+        assert_eq!(delta, 20);
+        ptr = 12;
+        assert!(s.is_done(&mut ptr));
+        assert!(!s.is_error());
+        s.pop_limit(ptr, delta);
     }
 }

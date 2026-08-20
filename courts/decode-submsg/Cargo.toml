@@ -1,0 +1,12 @@
+[package]
+name = "court-decode-submsg"
+version = "0.1.0"
+edition = "2021"
+description = "Differential court: linked sub-message decode (singular merge, repeated, nested, recursive, depth limits), oracle (real upb_Decode over a pool of linked mini tables) vs DUT (upb-rs-wire decode_submsg)"
+
+[dependencies]
+upb-rs-casefile = { version = "0.1.0", path = "../../crates/upb-rs-casefile" }
+upb-rs-oracle = { version = "0.1.3", path = "../../crates/upb-rs-oracle" }
+upb-rs-wire = { version = "0.1.4", path = "../../crates/upb-rs-wire" }
+serde = { workspace = true }
+serde_json = { workspace = true }

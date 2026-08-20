@@ -15,7 +15,8 @@ happy-path tests.
 | wire decode: fixed32/64   | ORACLE-TESTED | courts/wire-primitives (1537 cases, 0 residuals)       |
 | wire decode: skip         | ORACLE-TESTED | courts/wire-primitives (1537 cases, 0 residuals)       |
 | wire decode: message (empty mini table, pure unknown fields) | ORACLE-TESTED | courts/decode-empty (338 cases, 0 residuals) |
-| wire decode: message (known fields) | PARITY-SEALED | courts/decode-known (516 cases, 0 residuals; scope: scalars, strings/bytes, repeated, oneofs) |
+| wire decode: message (known fields) | PARITY-SEALED | courts/decode-known (517 cases, 0 residuals; scope: scalars, strings/bytes, repeated, oneofs) |
+| wire decode: sub-messages | PARITY-SEALED | courts/decode-submsg (93 cases, 0 residuals; merge, repeated, nested, recursive, depth limits) |
 | wire encode               | UNMAPPED      | —                                                     |
 | mini tables               | ORACLE-TESTED | courts/mini-table-inspect (701 cases, 0 residuals)  |
 | mini descriptors          | ORACLE-TESTED | courts/mini-table-inspect (701 cases, 0 residuals)  |
@@ -32,14 +33,15 @@ happy-path tests.
 
 ## Current phase
 
-Phase 0 (archaeology + court infrastructure) is established; the wire-primitives,
-decode-empty, mini-table-inspect, and decode-known courts are live and sealed
-at 0 residuals over the charter boundary-length corpus. The decode-known court
-seals known-field message decode for its declared scope (scalars, strings/bytes,
-repeated unpacked+packed, oneofs, unknown fields, wire-type mismatches,
-truncations): 516/516 cases equal, including the SInt32/SInt64 zigzag munge
-path whose 27 residuals were closed (casefiles dk-sint32-* / dk-sint64-* /
-dk-psint32-* remain in the historical receipts as permanent regression
-evidence). Next milestones per forensics/OPEN_QUESTIONS.md: submessage/map/
-group/closed-enum decode (with linked sub-tables), the encoder court, and the
-schema synthesis engine.
+Phase 0 (archaeology + court infrastructure) is established; five courts are
+live and sealed at 0 residuals over the charter boundary-length corpus:
+wire-primitives (1537), decode-empty (338), mini-table-inspect (701),
+decode-known (517), and decode-submsg (93). The decode-submsg court seals
+linked sub-message decode — singular merge semantics, repeated/nested/
+recursive sub-messages, depth budget boundaries (MaxDepthExceeded),
+truncations, size/budget overruns, unlinked slots — and caught two
+implementation defects on the way (the oneof-case-word dump regression,
+casefile oneof-case-word-dump; an oracle tooling validation bug). Next
+milestones per forensics/OPEN_QUESTIONS.md: maps, groups, and closed enums
+(with linked sub-enums), then the encoder court, and the schema synthesis
+engine.

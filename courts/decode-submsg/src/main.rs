@@ -1,18 +1,21 @@
-//! decode-known differential court.
+//! decode-submsg differential court.
 //!
 //! Runs the generated corpus against BOTH the pinned upstream oracle
-//! (`tools/oracle/build/oracle`, protocol v1, op `decode_known` — a real
-//! `upb_Decode` into a message whose mini table is built from a mini
-//! descriptor) and the upb-rs DUT (`upb-rs-wire` `message_known::decode_known`).
+//! (`tools/oracle/build/oracle`, protocol v1, op `decode_submsg` — a real
+//! `upb_Decode` over a pool of mini tables built from `mds` and linked by
+//! `upb_MiniTable_SetSubMessage` per `links`) and the upb-rs DUT
+//! (`upb-rs-wire` `message_known::decode_submsg`).
 //!
-//! The observable compared is: decode status (ok | malformed | bad_utf8) and,
-//! on success, the normalized accessor dump (per-field stored bytes or
-//! content, oneof case words, unknown-field bytes).
+//! The observable compared is: decode status (ok | malformed |
+//! max_depth_exceeded) and, on success, the normalized recursive accessor
+//! dump (nested sub-message objects, oneof case words, per-message unknown
+//! bytes).
 //!
-//! Surface (v1): scalar fields of all varint/fixed/floating types,
-//! string/bytes, repeated scalars (unpacked + packed), repeated strings,
-//! oneofs. Submessages/maps/groups/closed enums are deferred; the corpus
-//! generator never emits them.
+//! Surface (v1): linked sub-messages — singular (with merge semantics),
+//! repeated, nested, recursive (self- and mutual), oneof members, depth
+//! limits, truncations, size/budget overruns, unknown fields inside
+//! sub-messages, unlinked slots. Maps, groups, and closed enums are deferred;
+//! the corpus generator never emits them.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -20,16 +23,18 @@ use std::path::{Path, PathBuf};
 use upb_rs_casefile::{CaseMetadata, CaseResult, CourtSummary, ResidualRecord};
 use upb_rs_oracle::client::OracleClient;
 use upb_rs_oracle::protocol::ResponseStatus;
-use upb_rs_wire::message_known::decode_known;
+use upb_rs_wire::message_known::{decode_submsg, KnownDecodeError};
 
-const COURT: &str = "decode-known-v1";
+const COURT: &str = "decode-submsg-v1";
 const UPSTREAM_SHA: &str = "2de70d710510ea7c5ad7ec0c72bfed7f411c7b60";
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct CorpusCase {
     op: String,
     hex: String,
-    md: Option<String>,
+    mds: Option<Vec<String>>,
+    links: Option<Vec<Vec<u64>>>,
+    depth: Option<u64>,
     kind: String,
     seed: u64,
 }
@@ -84,10 +89,10 @@ fn main() {
         .collect();
     let cases: Vec<&CorpusCase> = all_cases
         .iter()
-        .filter(|c| c.op == "decode_known")
+        .filter(|c| c.op == "decode_submsg")
         .collect();
     println!(
-        "loaded {} decode_known cases from {}",
+        "loaded {} decode_submsg cases from {}",
         cases.len(),
         cases_path.display()
     );
@@ -101,33 +106,41 @@ fn main() {
 
     for (index, c) in cases.iter().enumerate() {
         let input = hex_decode(&c.hex);
-        let md = match &c.md {
-            Some(m) => hex_decode(m),
-            None => panic!("decode_known case without md: {}", c.kind),
-        };
+        let mds_raw = c
+            .mds
+            .as_ref()
+            .unwrap_or_else(|| panic!("decode_submsg case without mds: {}", c.kind));
+        let mds: Vec<Vec<u8>> = mds_raw.iter().map(|m| hex_decode(m)).collect();
+        let links: Vec<Vec<u64>> = c.links.clone().unwrap_or_default();
+        let depth: u32 = c.depth.unwrap_or(0) as u32;
 
-        // Oracle: real upb_Decode with a mini table built from the descriptor.
+        // Oracle: real upb_Decode over the linked table pool.
         let resp = oracle
-            .decode_known(&md, &input)
+            .decode_submsg(&mds, &links, &input, depth)
             .unwrap_or_else(|e| panic!("oracle failure at case {index} ({}): {e}", c.kind));
 
         // DUT.
-        let dut = decode_known(&md, &input, 0);
+        let mds_refs: Vec<&[u8]> = mds.iter().map(|m| m.as_slice()).collect();
+        let links_owned: Vec<Vec<usize>> = links
+            .iter()
+            .map(|l| l.iter().map(|&x| x as usize).collect::<Vec<_>>())
+            .collect();
+        let links_refs: Vec<&[usize]> = links_owned.iter().map(|l| l.as_slice()).collect();
+        let dut = decode_submsg(&mds_refs, &links_refs, &input, depth);
 
         let equal = match (&resp.status, &dut) {
             (ResponseStatus::Ok, Ok(msg)) => {
-                let ts = upb_rs_wire::message_known::TableSet::from_single(&md).unwrap();
+                let ts = upb_rs_wire::message_known::TableSet::from_pool(&mds_refs, &links_refs)
+                    .unwrap();
                 resp.dump.as_ref() == Some(&msg.dump(&ts, 0))
             }
             (ResponseStatus::Error, Err(e)) => {
                 let oracle_code = resp.code.as_deref().unwrap_or("");
                 let dut_code = match e {
-                    upb_rs_wire::message_known::KnownDecodeError::Malformed => "malformed",
-                    upb_rs_wire::message_known::KnownDecodeError::BadUtf8 => "bad_utf8",
-                    upb_rs_wire::message_known::KnownDecodeError::MaxDepthExceeded => {
-                        "max_depth_exceeded"
-                    }
-                    upb_rs_wire::message_known::KnownDecodeError::Unsupported(_) => "unsupported",
+                    KnownDecodeError::Malformed => "malformed",
+                    KnownDecodeError::BadUtf8 => "bad_utf8",
+                    KnownDecodeError::MaxDepthExceeded => "max_depth_exceeded",
+                    KnownDecodeError::Unsupported(_) => "unsupported",
                 };
                 oracle_code == dut_code
             }
@@ -140,7 +153,9 @@ fn main() {
             let oracle_json = serde_json::to_value(&resp).expect("serialize oracle response");
             let dut_json = match &dut {
                 Ok(msg) => {
-                    let ts = upb_rs_wire::message_known::TableSet::from_single(&md).unwrap();
+                    let ts =
+                        upb_rs_wire::message_known::TableSet::from_pool(&mds_refs, &links_refs)
+                            .unwrap();
                     serde_json::json!({
                         "status": "ok", "dump": msg.dump(&ts, 0), "v": 1, "id": index as u64
                     })
@@ -152,7 +167,7 @@ fn main() {
             let o_status = format!("{:?}", resp.status).to_lowercase();
             residuals.push(ResidualRecord {
                 metadata: CaseMetadata {
-                    id: format!("dk-{:06}", index),
+                    id: format!("dsm-{:06}", index),
                     court: COURT.to_string(),
                     oracle: UPSTREAM_SHA.to_string(),
                     op: c.op.clone(),
@@ -161,7 +176,7 @@ fn main() {
                     seed: c.seed,
                     classification: None,
                     date: timestamp(),
-                    notes: format!("kind={}, md={}", c.kind, c.md.clone().unwrap_or_default()),
+                    notes: format!("kind={}, mds={:?}, links={:?}", c.kind, c.mds, c.links),
                 },
                 result: CaseResult {
                     oracle: oracle_json,
@@ -176,7 +191,9 @@ fn main() {
                 oracle_value: resp.dump.as_ref().map(|d| d.to_string()),
                 dut_value: match &dut {
                     Ok(msg) => {
-                        let ts = upb_rs_wire::message_known::TableSet::from_single(&md).unwrap();
+                        let ts =
+                            upb_rs_wire::message_known::TableSet::from_pool(&mds_refs, &links_refs)
+                                .unwrap();
                         Some(msg.dump(&ts, 0).to_string())
                     }
                     Err(e) => Some(e.to_string()),
@@ -298,7 +315,7 @@ fn rust_revision() -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     let mut files: Vec<PathBuf> = Vec::new();
-    for dir in ["crates", "tools/corpus/src", "courts/decode-known/src"] {
+    for dir in ["crates", "tools/corpus/src", "courts/decode-submsg/src"] {
         let d = Path::new(dir);
         if let Ok(entries) = fs::read_dir(d) {
             for e in entries.flatten() {

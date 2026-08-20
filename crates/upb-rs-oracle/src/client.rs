@@ -9,6 +9,7 @@ use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use crate::protocol::{OracleRequest, OracleResponse};
+use serde::Deserialize;
 
 #[derive(Debug)]
 pub enum OracleError {
@@ -94,8 +95,18 @@ impl OracleClient {
         if n == 0 {
             return Err(OracleError::Read("oracle closed stdout".to_string()));
         }
+        let value: serde_json::Value = {
+            // The decode-submsg court produces dumps nested as deep as the
+            // message depth (100+ levels), beyond serde_json's default
+            // recursion limit of 128. The oracle protocol is trusted output
+            // from a pinned oracle binary, so disabling the limit is safe.
+            let mut de = serde_json::Deserializer::from_str(buf.trim());
+            de.disable_recursion_limit();
+            serde_json::Value::deserialize(&mut de)
+                .map_err(|e| OracleError::Protocol(e.to_string()))?
+        };
         let resp: OracleResponse =
-            serde_json::from_str(buf.trim()).map_err(|e| OracleError::Protocol(e.to_string()))?;
+            serde_json::from_value(value).map_err(|e| OracleError::Protocol(e.to_string()))?;
         if resp.id != req.id {
             return Err(OracleError::Unpaired {
                 expected: req.id,
@@ -145,6 +156,8 @@ impl OracleClient {
             tag: None,
             depth: None,
             md: None,
+            mds: None,
+            links: None,
         })?;
         if resp.echo.as_deref() != Some("pong") {
             return Err(OracleError::Protocol("ping did not return pong".into()));
@@ -176,6 +189,8 @@ impl OracleClient {
             tag: None,
             depth: None,
             md: None,
+            mds: None,
+            links: None,
         };
         self.request(&req)
     }
@@ -189,6 +204,21 @@ impl OracleClient {
         let id = self.next_id;
         self.next_id += 1;
         let req = OracleRequest::decode_known(id, md, payload);
+        self.request(&req)
+    }
+
+    /// Sends a decode_submsg request (real upb_Decode over a pool of linked
+    /// mini tables).
+    pub fn decode_submsg(
+        &mut self,
+        mds: &[Vec<u8>],
+        links: &[Vec<u64>],
+        payload: &[u8],
+        depth: u32,
+    ) -> Result<OracleResponse, OracleError> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let req = OracleRequest::decode_submsg(id, mds, links, payload, depth);
         self.request(&req)
     }
 }

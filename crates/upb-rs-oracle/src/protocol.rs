@@ -40,6 +40,13 @@ pub struct OracleRequest {
     pub depth: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub md: Option<String>,
+    /// decode_submsg: the pool descriptors (hex), main first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mds: Option<Vec<String>>,
+    /// decode_submsg: per-table sub-slot -> table index (slot order = field
+    /// order).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub links: Option<Vec<Vec<u64>>>,
 }
 
 impl OracleRequest {
@@ -52,6 +59,8 @@ impl OracleRequest {
             tag: None,
             depth: None,
             md: None,
+            mds: None,
+            links: None,
         }
     }
 
@@ -64,6 +73,8 @@ impl OracleRequest {
             tag: Some(tag as u64),
             depth: None,
             md: None,
+            mds: None,
+            links: None,
         }
     }
 
@@ -76,6 +87,8 @@ impl OracleRequest {
             tag: Some(tag as u64),
             depth: None,
             md: None,
+            mds: None,
+            links: None,
         }
     }
 
@@ -88,6 +101,8 @@ impl OracleRequest {
             tag: None,
             depth: Some(depth as u64),
             md: None,
+            mds: None,
+            links: None,
         }
     }
 
@@ -100,6 +115,28 @@ impl OracleRequest {
             tag: None,
             depth: None,
             md: Some(hex_encode(md)),
+            mds: None,
+            links: None,
+        }
+    }
+
+    pub fn decode_submsg(
+        id: u64,
+        mds: &[Vec<u8>],
+        links: &[Vec<u64>],
+        payload: &[u8],
+        depth: u32,
+    ) -> OracleRequest {
+        OracleRequest {
+            v: 1,
+            id,
+            op: "decode_submsg".to_string(),
+            hex: hex_encode(payload),
+            tag: None,
+            depth: Some(depth as u64),
+            md: None,
+            mds: Some(mds.iter().map(|m| hex_encode(m)).collect()),
+            links: Some(links.to_vec()),
         }
     }
 }

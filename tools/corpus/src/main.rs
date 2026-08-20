@@ -38,6 +38,12 @@ struct Case {
     depth: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     md: Option<String>,
+    /// decode_submsg: pool descriptors (hex), main first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mds: Option<Vec<String>>,
+    /// decode_submsg: per-table sub-slot -> table index.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    links: Option<Vec<Vec<u64>>>,
     kind: String,
     seed: u64,
 }
@@ -101,6 +107,8 @@ impl CaseSet {
             tag,
             depth: None,
             md: None,
+            mds: None,
+            links: None,
             kind: kind.to_string(),
             seed: self.seed,
         });
@@ -113,6 +121,45 @@ impl CaseSet {
             tag: None,
             depth: None,
             md: Some(hex(md)),
+            mds: None,
+            links: None,
+            kind: kind.to_string(),
+            seed: self.seed,
+        });
+    }
+
+    /// decode_submsg case: a pool of linked mini tables plus a payload.
+    fn push_submsg(&mut self, mds: &[Vec<u8>], links: &[Vec<u64>], bytes: &[u8], kind: &str) {
+        self.cases.push(Case {
+            op: "decode_submsg".to_string(),
+            hex: hex(bytes),
+            tag: None,
+            depth: None,
+            md: None,
+            mds: Some(mds.iter().map(|m| hex(m)).collect()),
+            links: Some(links.to_vec()),
+            kind: kind.to_string(),
+            seed: self.seed,
+        });
+    }
+
+    /// decode_submsg case with an explicit depth option.
+    fn push_submsg_depth(
+        &mut self,
+        mds: &[Vec<u8>],
+        links: &[Vec<u64>],
+        bytes: &[u8],
+        depth: u64,
+        kind: &str,
+    ) {
+        self.cases.push(Case {
+            op: "decode_submsg".to_string(),
+            hex: hex(bytes),
+            tag: None,
+            depth: Some(depth),
+            md: None,
+            mds: Some(mds.iter().map(|m| hex(m)).collect()),
+            links: Some(links.to_vec()),
             kind: kind.to_string(),
             seed: self.seed,
         });
@@ -125,6 +172,8 @@ impl CaseSet {
             tag: None,
             depth: Some(depth),
             md: None,
+            mds: None,
+            links: None,
             kind: kind.to_string(),
             seed: self.seed,
         });
@@ -1131,6 +1180,10 @@ fn gen_decode_known_corpus(set: &mut CaseSet) {
             &[0x20u8, 0x01, 0x08, 0x2A],
             "dk-oneof-unknown",
         );
+        // Empty message: the case word is 0 and every oneof offset is still
+        // reported (oracle-verified; the DUT dump regression this caught is
+        // preserved in casefile dsm-000074).
+        set.push_md("decode_known", &md, &[], "dk-oneof-empty");
     }
 
     // Repeated strings and bytes.
@@ -1168,6 +1221,334 @@ fn gen_decode_known_corpus(set: &mut CaseSet) {
     }
 }
 
+/// A payload nesting `depth` sub-messages of the recursive schema
+/// R { R r = 1; } (each level: tag 0x0A + size varint; innermost: 0x0A 0x00).
+fn recursive_payload(depth: usize) -> Vec<u8> {
+    let mut p = vec![0x0Au8, 0x00];
+    for _ in 1..depth {
+        let mut head = vec![0x0Au8];
+        encode_varint(p.len() as u64, &mut head);
+        let mut n = head;
+        n.extend_from_slice(&p);
+        p = n;
+    }
+    p
+}
+
+fn gen_decode_submsg_corpus(set: &mut CaseSet) {
+    use mdgen::*;
+
+    // Descriptor builders. Every generated descriptor is pinned against the
+    // oracle's mini_table_inspect in the court's unit tests; the encoded
+    // types below are the kUpb_EncodedType values (wire_constants.h:16-38).
+    fn md_fields(fields: &[(u32, usize)]) -> Vec<u8> {
+        let mut e = MessageEncoder::new(0);
+        for &(n, t) in fields {
+            e.field(n, t, 0);
+        }
+        e.finish()
+    }
+    fn md_oneof(fields: &[(u32, usize)]) -> Vec<u8> {
+        let mut e = MessageEncoder::new(0);
+        for &(n, t) in fields {
+            e.field(n, t, 0);
+        }
+        e.start_oneofs();
+        for (i, &(n, _)) in fields.iter().enumerate() {
+            e.oneof_field(n, i == 0);
+        }
+        e.finish()
+    }
+    fn push_truncations(
+        set: &mut CaseSet,
+        mds: &[Vec<u8>],
+        links: &[Vec<u64>],
+        full: &[u8],
+        kind: &str,
+    ) {
+        for i in 0..full.len() {
+            set.push_submsg(mds, links, &full[..i], &format!("{kind}-trunc{i}"));
+        }
+    }
+
+    let sub_b = md_fields(&[(1, 7)]); // B { uint32 x = 1; }
+    let sub_bi = md_fields(&[(1, 7), (2, 6)]); // B { uint32 x; int32 y; }
+    let sub_bb = md_fields(&[(1, 13)]); // B { bool f = 1; }
+    let sub_c64 = md_fields(&[(1, 11)]); // C { sint64 z = 1; }
+    let sub_s = md_fields(&[(1, 15)]); // S { string s = 1; }
+    let a_b = md_fields(&[(1, 17)]); // A { B b = 1; }
+    let a_bb = md_fields(&[(1, 17), (2, 17)]); // A { B b = 1; B c = 2; }
+    let a_rb = md_fields(&[(1, 17 + REPEATED_BASE)]); // A { repeated B b = 1; }
+    let a_bn = md_fields(&[(1, 17), (2, 7)]); // A { B b = 1; uint32 n = 2; }
+    let a_oneof = md_oneof(&[(1, 17), (2, 7)]); // A { oneof { B b; uint32 x; } }
+
+    // Singular sub-message with content/merge/unknown/hostile payloads.
+    {
+        let mds = vec![a_b.clone(), sub_b.clone()];
+        let links = vec![vec![1], vec![]];
+        set.push_submsg(&mds, &links, &[], "sm-empty");
+        set.push_submsg(&mds, &links, &[0x0A, 0x00], "sm-sub-empty");
+        set.push_submsg(&mds, &links, &[0x0A, 0x02, 0x08, 0x01], "sm-sub-scalar");
+        set.push_submsg(&mds, &links, &[0x0A, 0x01, 0x08], "sm-sub-trunc");
+        set.push_submsg(&mds, &links, &[0x0A, 0x05, 0x08], "sm-sub-size-overrun");
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x03, 0x98, 0x06, 0x05],
+            "sm-sub-unknown",
+        );
+        set.push_submsg(&mds, &links, &[0x08, 0x01], "sm-wrong-wire");
+        set.push_submsg(&mds, &links, &[0x0A, 0x01, 0x00], "sm-sub-field0");
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x02, 0x10, 0x02],
+            "sm-sub-other-field",
+        );
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x02, 0x0A, 0x00],
+            "sm-sub-wire-mismatch",
+        );
+        set.push_submsg(&mds, &links, &[0x0A, 0x00, 0x0A, 0x00], "sm-sub-two-empty");
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x02, 0x08, 0x01, 0x0A, 0x02, 0x08, 0x02],
+            "sm-sub-scalar-merge",
+        );
+        // Unlinked sub slot -> unknown field (upstream link.h semantics).
+        let unlinked = vec![vec![], vec![]];
+        set.push_submsg(
+            &mds,
+            &unlinked,
+            &[0x0A, 0x02, 0x08, 0x01],
+            "sm-unlinked-unknown",
+        );
+    }
+    // Merge into a two-field sub-message, with truncations.
+    {
+        let mds = vec![a_b.clone(), sub_bi.clone()];
+        let links = vec![vec![1], vec![]];
+        let full = [0x0A, 0x02, 0x08, 0x01, 0x0A, 0x02, 0x10, 0x02];
+        set.push_submsg(&mds, &links, &full, "sm-merge");
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x02, 0x10, 0x01, 0x0A, 0x02, 0x10, 0x02],
+            "sm-merge-overwrite",
+        );
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x02, 0x08, 0x01, 0x0A, 0x00],
+            "sm-merge-empty-second",
+        );
+        push_truncations(set, &mds, &links, &full, "sm-merge");
+    }
+    // Repeated sub-messages.
+    {
+        let mds = vec![a_rb.clone(), sub_bb.clone()];
+        let links = vec![vec![1], vec![]];
+        set.push_submsg(&mds, &links, &[], "sm-rep-empty");
+        set.push_submsg(&mds, &links, &[0x0A, 0x02, 0x08, 0x00], "sm-rep-1");
+        let full = [0x0A, 0x02, 0x08, 0x01, 0x0A, 0x02, 0x08, 0x00];
+        set.push_submsg(&mds, &links, &full, "sm-rep-2");
+        set.push_submsg(&mds, &links, &[0x0A, 0x00, 0x0A, 0x00], "sm-rep-two-empty");
+        set.push_submsg(&mds, &links, &[0x0A, 0x02, 0x08], "sm-rep-trunc");
+        push_truncations(set, &mds, &links, &full, "sm-rep-2");
+    }
+    // Nested A { B { C { sint64 } } }.
+    {
+        let mds = vec![a_b.clone(), a_b.clone(), sub_c64.clone()];
+        let links = vec![vec![1], vec![2], vec![]];
+        set.push_submsg(&mds, &links, &[], "sm-nest-empty");
+        set.push_submsg(&mds, &links, &[0x0A, 0x00], "sm-nest-1");
+        set.push_submsg(&mds, &links, &[0x0A, 0x02, 0x0A, 0x00], "sm-nest-2");
+        let full = [0x0A, 0x04, 0x0A, 0x02, 0x08, 0x01];
+        set.push_submsg(&mds, &links, &full, "sm-nest-z");
+        set.push_submsg(&mds, &links, &[0x0A, 0x02, 0x0A, 0x05], "sm-nest-budget");
+        push_truncations(set, &mds, &links, &full, "sm-nest-z");
+    }
+    // Recursive (self-link) and depth boundaries.
+    {
+        let mds = vec![a_b.clone()];
+        let links = vec![vec![0]];
+        set.push_submsg(&mds, &links, &[], "sm-rec-0");
+        set.push_submsg(&mds, &links, &[0x0A, 0x00], "sm-rec-1");
+        set.push_submsg(&mds, &links, &[0x0A, 0x02, 0x0A, 0x00], "sm-rec-2");
+        let rec3 = [0x0A, 0x04, 0x0A, 0x02, 0x0A, 0x00];
+        set.push_submsg(&mds, &links, &rec3, "sm-rec-3");
+        push_truncations(set, &mds, &links, &rec3, "sm-rec-3");
+        for d in [1usize, 2, 50, 99, 100, 101] {
+            set.push_submsg(
+                &mds,
+                &links,
+                &recursive_payload(d),
+                &format!("sm-depth-{d}"),
+            );
+        }
+        // Explicit depth options at the boundary.
+        for &(opt, d) in &[
+            (50u64, 50usize),
+            (50, 51),
+            (100, 100),
+            (100, 101),
+            (101, 101),
+            (101, 102),
+        ] {
+            set.push_submsg_depth(
+                &mds,
+                &links,
+                &recursive_payload(d),
+                opt,
+                &format!("sm-depth-opt{opt}-{d}"),
+            );
+        }
+    }
+    // Mutual recursion: A { B b = 1; } B { A a = 1; }.
+    {
+        let mds = vec![a_b.clone(), a_b.clone()];
+        let links = vec![vec![1], vec![0]];
+        set.push_submsg(&mds, &links, &[], "sm-mut-0");
+        set.push_submsg(&mds, &links, &[0x0A, 0x00], "sm-mut-1");
+        set.push_submsg(&mds, &links, &[0x0A, 0x02, 0x0A, 0x00], "sm-mut-2");
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x04, 0x0A, 0x02, 0x0A, 0x00],
+            "sm-mut-3",
+        );
+    }
+    // Oneof with a sub-message member: switch clears, re-set merges.
+    {
+        let mds = vec![a_oneof.clone(), sub_b.clone()];
+        let links = vec![vec![1], vec![]];
+        set.push_submsg(&mds, &links, &[], "sm-oneof-empty");
+        set.push_submsg(&mds, &links, &[0x0A, 0x02, 0x08, 0x01], "sm-oneof-b");
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x02, 0x08, 0x01, 0x10, 0x07],
+            "sm-oneof-switch",
+        );
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x10, 0x07, 0x0A, 0x02, 0x08, 0x01],
+            "sm-oneof-scalar-then-b",
+        );
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x02, 0x08, 0x01, 0x0A, 0x02, 0x08, 0x02],
+            "sm-oneof-b-merge",
+        );
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x00, 0x10, 0x01],
+            "sm-oneof-empty-b-then-x",
+        );
+        set.push_submsg(&mds, &links, &[0x28, 0x05], "sm-oneof-unknown");
+    }
+    // Two sub-message fields sharing one sub table (slot order matters).
+    {
+        let mds = vec![a_bb.clone(), sub_b.clone()];
+        let links = vec![vec![1, 1], vec![]];
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x02, 0x08, 0x01, 0x12, 0x02, 0x08, 0x02],
+            "sm-multi-bc",
+        );
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x02, 0x08, 0x01, 0x0A, 0x02, 0x08, 0x03],
+            "sm-multi-bb",
+        );
+    }
+    // Sub-message with a scalar sibling.
+    {
+        let mds = vec![a_bn.clone(), sub_b.clone()];
+        let links = vec![vec![1], vec![]];
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x02, 0x08, 0x01, 0x10, 0x05],
+            "sm-bn-both",
+        );
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x10, 0x05, 0x0A, 0x02, 0x08, 0x01],
+            "sm-bn-scalar-first",
+        );
+    }
+    // String inside a sub-message (no UTF-8 validation at this pin).
+    {
+        let mds = vec![a_b.clone(), sub_s.clone()];
+        let links = vec![vec![1], vec![]];
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x03, 0x0A, 0x01, 0xFF],
+            "sm-sub-bad-utf8",
+        );
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x02, 0x0A, 0x00],
+            "sm-sub-empty-string",
+        );
+    }
+    // Packed repeated inside a sub-message.
+    {
+        let sub_packed = md_fields(&[(1, 7 + REPEATED_BASE)]); // B { repeated uint32 xs = 1; }
+        let mds = vec![a_b.clone(), sub_packed.clone()];
+        let links = vec![vec![1], vec![]];
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x05, 0x0A, 0x03, 0x01, 0x02, 0x03],
+            "sm-packed-in-sub",
+        );
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x02, 0x0A, 0x01],
+            "sm-packed-in-sub-trunc",
+        );
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x02, 0x0A, 0x00],
+            "sm-packed-in-sub-empty",
+        );
+    }
+    // Hostile sizes: huge declared sub-message size, and overlong size
+    // varints, must all be malformed (PushLimit delta < 0 / size bounds).
+    {
+        let mds = vec![a_b.clone(), sub_b.clone()];
+        let links = vec![vec![1], vec![]];
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0xFE, 0xFF, 0xFF, 0xFF, 0x07],
+            "sm-huge-size",
+        );
+        set.push_submsg(&mds, &links, &[0x0A, 0x81, 0x80, 0x00], "sm-overlong-size");
+        set.push_submsg(
+            &mds,
+            &links,
+            &[0x0A, 0x80, 0x80, 0x80, 0x80, 0x00],
+            "sm-5byte-size-zero",
+        );
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut seed = DEFAULT_SEED;
@@ -1202,6 +1583,7 @@ fn main() {
     gen_decode_empty_corpus(&mut set);
     gen_mini_table_corpus(&mut set);
     gen_decode_known_corpus(&mut set);
+    gen_decode_submsg_corpus(&mut set);
 
     fs::create_dir_all(&out).expect("create corpus dir");
     let cases_path = out.join("cases.jsonl");

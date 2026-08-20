@@ -87,6 +87,7 @@ already-parsed tag value (`field_number << 3 | wire_type`), decimal.
 | `decode_empty`| `upb_Decode` (empty mini table)| —   | real message decode; every field is unknown; see below |
 | `mini_table_inspect`| `upb_MiniTable_Build` | — | builds a mini table from a mini descriptor; see below |
 | `decode_known` | `upb_Decode` (mini table from descriptor) | — | real message decode with known fields; see below |
+| `decode_submsg` | `upb_Decode` (pool of linked mini tables) | — | sub-message decode with linked sub-slots; see below |
 | `ping`        | —                        | —   | protocol self-test |
 
 ## `mini_table_inspect`
@@ -181,9 +182,42 @@ Request fields: `hex` (the message bytes), `md` (mini descriptor hex), `depth`
 Statuses: `ok` (with `dump`), or `error` with `code` one of `malformed`,
 `max_depth_exceeded`, `oom`, `minitable_build_failed`, `bad_hex`, `other`.
 
+## `decode_submsg`
+
+Runs the **real** `upb_Decode` from the pinned library against a pool of
+mini tables: `mds` (array of hex mini descriptors, main first) is built with
+`upb_MiniTable_Build`, then sub-slots are linked with
+`upb_MiniTable_SetSubMessage` in field order — `links[t][s]` is the table
+index (into `mds`) for table `t`'s sub-slot `s`. Sub-slots without a link
+entry stay unlinked and decode as unknown fields, per upstream's contract
+(`mini_descriptor/link.h`).
+
+```json
+{"v":1,"id":1,"op":"decode_submsg",
+ "mds":["2433","2429"],"links":[[1],[]],
+ "hex":"0a020801","depth":100}
+```
+
+This exercises the linked sub-message decode path end-to-end: `PushLimit`/
+`PopLimit` payload bounding, depth budget decrement (`MaxDepthExceeded` at
+100/101 boundaries), merge semantics for repeated occurrences of singular
+sub-message fields, repeated sub-message elements, recursion through
+self-/mutual links, unknown fields inside sub-messages, and unlinked slots.
+
+The `dump` is the recursive extension of the `decode_known` dump:
+sub-message field values are nested dump objects, repeated sub-messages are
+arrays of dump objects, and each message level carries its own `oneof_cases`
+and `unknown`. `oneof_cases` lists every distinct case offset with its
+current case word (0 when unset) — presence-independent, oracle-verified
+(casefile oneof-case-word-dump).
+
+Statuses: `ok` (with `dump`), or `error` with `code` one of `malformed`,
+`max_depth_exceeded`, `oom`, `minitable_build_failed`, `bad_hex`,
+`bad_links`, `link_failed`, `other`.
+
 ## Extensions
 
 New ops are additive and versioned by `"v"`. The corpus generator supplies the
-mini table (as a mini descriptor) in the request; ops that need descriptor
+mini tables (as mini descriptors) in the request; ops that need descriptor
 provenance beyond a mini descriptor (extensions, maps of messages, groups)
 will be added as `decode_message` variants in a later protocol version.

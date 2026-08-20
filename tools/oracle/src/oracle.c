@@ -98,6 +98,69 @@ static int json_int(const char* line, const char* name, int64_t* out) {
   return 0;
 }
 
+// Extract a JSON array of strings: "name":["a","b",...]. Each element is
+// NUL-terminated into out[i]; returns the element count, or -1.
+static int json_string_array(const char* line, const char* name,
+                             char out[][MAX_INPUT_BYTES], int max) {
+  size_t nlen = strlen(name);
+  const char* p = strstr(line, name);
+  if (!p) return -1;
+  p += nlen;
+  while (*p && (*p == ' ' || *p == ':')) p++;
+  if (*p != '[') return -1;
+  p++;
+  int count = 0;
+  for (;;) {
+    while (*p == ' ' || *p == ',') p++;
+    if (*p == ']') break;
+    if (*p != '"' || count >= max) return -1;
+    p++;
+    size_t o = 0;
+    while (*p && *p != '"' && o + 1 < MAX_INPUT_BYTES) out[count][o++] = *p++;
+    if (*p != '"') return -1;
+    p++;
+    out[count][o] = '\0';
+    count++;
+  }
+  return count;
+}
+
+// Extract a JSON array of arrays of integers: "name":[[1,2],[3]]. Row i is
+// written to out[i][0..len[i]); returns the row count, or -1.
+static int json_int_array2(const char* line, const char* name,
+                           int64_t out[][64], int* len, int max_rows) {
+  size_t nlen = strlen(name);
+  const char* p = strstr(line, name);
+  if (!p) return -1;
+  p += nlen;
+  while (*p && (*p == ' ' || *p == ':')) p++;
+  if (*p != '[') return -1;
+  p++;
+  int rows = 0;
+  for (;;) {
+    while (*p == ' ' || *p == ',') p++;
+    if (*p == ']') break;
+    if (*p != '[' || rows >= max_rows) return -1;
+    p++;
+    int elems = 0;
+    for (;;) {
+      while (*p == ' ' || *p == ',') p++;
+      if (*p == ']') {
+        p++;
+        break;
+      }
+      char* end = NULL;
+      long long v = strtoll(p, &end, 10);
+      if (end == p || elems >= 64) return -1;
+      out[rows][elems++] = (int64_t)v;
+      p = end;
+    }
+    len[rows] = elems;
+    rows++;
+  }
+  return rows;
+}
+
 // ---------------------------------------------------------------------------
 // Output helpers
 // ---------------------------------------------------------------------------
@@ -550,16 +613,31 @@ static size_t field_elem_size(uint8_t type) {
   }
 }
 
-static void emit_dump(const upb_Message* msg, const upb_MiniTable* mt) {
+// kUpb_NoSub (mini_table/internal/field.h:37): no sub slot for this field.
+#define kUpb_NoSub_ ((uint16_t)0xFFFF)
+
+// True when the field carries a linked sub-message (descriptor type Message
+// with a sub slot). Group (10) and closed-enum (14) fields also reserve slots;
+// this court only emits Message fields.
+static int field_is_submsg(const upb_MiniTableField* f) {
+  return f->descriptortype_dont_copy_me__upb_internal_use_only == 11 &&
+         f->submsg_ofs_dont_copy_me__upb_internal_use_only != kUpb_NoSub_;
+}
+
+// Emits the normalized message object
+// {"fields":[...],"oneof_cases":[...],"unknown":"..."} for `msg` described
+// by `mt`, recursing into linked sub-message fields (court decode-submsg-v1).
+static void emit_msg_value(const upb_Message* msg, const upb_MiniTable* mt) {
   int field_count = upb_MiniTable_FieldCount(mt);
   int first_emitted = 1;
-  printf(",\"dump\":{\"fields\":[");
+  printf("{\"fields\":[");
   for (int i = 0; i < field_count; i++) {
     const upb_MiniTableField* f = upb_MiniTable_GetFieldByIndex(mt, i);
     uint32_t number = f->number_dont_copy_me__upb_internal_use_only;
     uint8_t type = f->descriptortype_dont_copy_me__upb_internal_use_only;
     uint16_t offset = f->offset_dont_copy_me__upb_internal_use_only;
     int is_array = (f->mode_dont_copy_me__upb_internal_use_only & 3) == 1;
+    int is_submsg = field_is_submsg(f);
     if (is_array) {
       if (!first_emitted) printf(",");
       first_emitted = 0;
@@ -567,18 +645,32 @@ static void emit_dump(const upb_Message* msg, const upb_MiniTable* mt) {
       const upb_Array* arr = *(const upb_Array**)((const char*)msg + offset);
       if (arr) {
         size_t n = upb_Array_Size(arr);
-        size_t esz = field_elem_size(type);
-        const char* data = (const char*)upb_Array_DataPtr(arr);
-        for (size_t j = 0; j < n; j++) {
-          if (j) printf(",");
-          printf("\"");
-          if (type == 9 || type == 12) {
-            const upb_StringView* sv = (const upb_StringView*)data + j;
-            emit_hex_bytes((const unsigned char*)sv->data, sv->size);
-          } else {
-            emit_hex_bytes((const unsigned char*)data + j * esz, esz);
+        if (is_submsg) {
+          const upb_MiniTable* subl = upb_MiniTable_SubMessage(f);
+          const upb_Message** elems =
+              (const upb_Message**)upb_Array_DataPtr(arr);
+          for (size_t j = 0; j < n; j++) {
+            if (j) printf(",");
+            if (subl) {
+              emit_msg_value(elems[j], subl);
+            } else {
+              printf("{\"fields\":[],\"oneof_cases\":[],\"unknown\":\"\"}");
+            }
           }
-          printf("\"");
+        } else {
+          size_t esz = field_elem_size(type);
+          const char* data = (const char*)upb_Array_DataPtr(arr);
+          for (size_t j = 0; j < n; j++) {
+            if (j) printf(",");
+            printf("\"");
+            if (type == 9 || type == 12) {
+              const upb_StringView* sv = (const upb_StringView*)data + j;
+              emit_hex_bytes((const unsigned char*)sv->data, sv->size);
+            } else {
+              emit_hex_bytes((const unsigned char*)data + j * esz, esz);
+            }
+            printf("\"");
+          }
         }
       }
       printf("]}");
@@ -597,17 +689,29 @@ static void emit_dump(const upb_Message* msg, const upb_MiniTable* mt) {
     if (!present) continue;
     if (!first_emitted) printf(",");
     first_emitted = 0;
-    printf("{\"number\":%u,\"value\":\"", number);
-    if (type == 9 || type == 12) {
+    printf("{\"number\":%u,\"value\":", number);
+    if (is_submsg) {
+      const upb_Message* sub = *(const upb_Message**)((const char*)msg + offset);
+      const upb_MiniTable* subl = upb_MiniTable_SubMessage(f);
+      if (subl) {
+        emit_msg_value(sub, subl);
+      } else {
+        printf("{\"fields\":[],\"oneof_cases\":[],\"unknown\":\"\"}");
+      }
+    } else if (type == 9 || type == 12) {
       const upb_StringView* sv =
           (const upb_StringView*)((const char*)msg + offset);
+      printf("\"");
       emit_hex_bytes((const unsigned char*)sv->data, sv->size);
+      printf("\"");
     } else {
       size_t n = field_elem_size(type);
       if (n > 8) n = 8;
+      printf("\"");
       emit_hex_bytes((const unsigned char*)((const char*)msg + offset), n);
+      printf("\"");
     }
-    printf("\"}");
+    printf("}");
   }
   printf("],\"oneof_cases\":[");
   // Collect and sort case offsets, then emit.
@@ -651,6 +755,11 @@ static void emit_dump(const upb_Message* msg, const upb_MiniTable* mt) {
     }
   }
   printf("\"}");
+}
+
+static void emit_dump(const upb_Message* msg, const upb_MiniTable* mt) {
+  printf(",\"dump\":");
+  emit_msg_value(msg, mt);
 }
 
 static void run_decode_known(int64_t id, const char* hex, const char* md,
@@ -699,6 +808,133 @@ static void run_decode_known(int64_t id, const char* hex, const char* md,
   if (ds == kUpb_DecodeStatus_Ok) {
     emit_header(id, "ok");
     emit_dump(msg, mt);
+    emit_end();
+  } else if (ds == kUpb_DecodeStatus_Malformed) {
+    emit_header(id, "error");
+    emit_field_str("code", "malformed");
+    emit_end();
+  } else if (ds == kUpb_DecodeStatus_BadUtf8) {
+    emit_header(id, "error");
+    emit_field_str("code", "bad_utf8");
+    emit_end();
+  } else if (ds == kUpb_DecodeStatus_MaxDepthExceeded) {
+    emit_header(id, "error");
+    emit_field_str("code", "max_depth_exceeded");
+    emit_end();
+  } else if (ds == kUpb_DecodeStatus_OutOfMemory) {
+    emit_header(id, "error");
+    emit_field_str("code", "oom");
+    emit_end();
+  } else {
+    emit_header(id, "error");
+    emit_field_str("code", "other");
+    emit_field_int("code_num", (int64_t)ds);
+    emit_end();
+  }
+  upb_Arena_Free(arena);
+}
+
+// ---------------------------------------------------------------------------
+// decode_submsg: build a pool of mini tables from `mds` (main first), link
+// sub slots in field order using `links` (per-table list of target table
+// indices, in sub-slot order), then run the real upb_Decode on the main
+// table and dump the decoded state recursively (court decode-submsg-v1).
+// ---------------------------------------------------------------------------
+
+#define MAX_TABLES 8
+
+static void run_decode_submsg(int64_t id, const char* hex, int64_t depth,
+                              char mds[][MAX_INPUT_BYTES], int n_mds,
+                              int64_t links[][64], int* link_lens) {
+  uint8_t input[MAX_INPUT_BYTES];
+  int n = parse_hex(hex, strlen(hex), input, sizeof(input));
+  if (n < 0) {
+    emit_header(id, "error");
+    emit_field_str("code", "bad_hex");
+    emit_end();
+    return;
+  }
+
+  upb_Arena* arena = upb_Arena_New();
+  upb_Status status;
+  upb_Status_Clear(&status);
+
+  upb_MiniTable* tables[MAX_TABLES] = {0};
+  for (int t = 0; t < n_mds; t++) {
+    uint8_t desc[MAX_INPUT_BYTES];
+    int dn = parse_hex(mds[t], strlen(mds[t]), desc, sizeof(desc));
+    if (dn < 0) {
+      emit_header(id, "error");
+      emit_field_str("code", "bad_hex");
+      emit_end();
+      upb_Arena_Free(arena);
+      return;
+    }
+    tables[t] =
+        upb_MiniTable_Build((const char*)desc, (size_t)dn, arena, &status);
+    if (!tables[t]) {
+      emit_header(id, "error");
+      emit_field_str("code", "minitable_build_failed");
+      printf(",\"msg\":");
+      emit_json_string_raw(status.msg);
+      emit_end();
+      upb_Arena_Free(arena);
+      return;
+    }
+  }
+
+  // Link sub slots in field order (sub-slot i of table t -> tables[links[t][i]]).
+  // Slots without a provided link stay unlinked, matching upstream's contract
+  // (mini_descriptor/link.h: "If a sub-message field is not linked, it will
+  // be treated as an unknown field during parsing"); once the provided links
+  // are exhausted, all remaining sub fields are unlinked.
+  for (int t = 0; t < n_mds; t++) {
+    int slot = 0;
+    int fc = upb_MiniTable_FieldCount(tables[t]);
+    for (int i = 0; i < fc; i++) {
+      upb_MiniTableField* f = (upb_MiniTableField*)upb_MiniTable_GetFieldByIndex(
+          tables[t], (uint32_t)i);
+      if (f->submsg_ofs_dont_copy_me__upb_internal_use_only == kUpb_NoSub_) {
+        continue;
+      }
+      if (slot >= link_lens[t]) break;  // remaining slots unlinked
+      int target = (int)links[t][slot];
+      if (target < 0 || target >= n_mds) {
+        emit_header(id, "error");
+        emit_field_str("code", "bad_links");
+        emit_end();
+        upb_Arena_Free(arena);
+        return;
+      }
+      if (!upb_MiniTable_SetSubMessage(tables[t], f, tables[target])) {
+        emit_header(id, "error");
+        emit_field_str("code", "link_failed");
+        emit_end();
+        upb_Arena_Free(arena);
+        return;
+      }
+      slot++;
+    }
+  }
+
+  upb_Message* msg = upb_Message_New(tables[0], arena);
+  if (!msg) {
+    emit_header(id, "error");
+    emit_field_str("code", "oom");
+    emit_end();
+    upb_Arena_Free(arena);
+    return;
+  }
+
+  int options = 0;
+  if (depth > 0 && depth <= 65535) {
+    options = (int)upb_DecodeOptions_MaxDepth((uint16_t)depth);
+  }
+  upb_DecodeStatus ds = upb_Decode((const char*)input, (size_t)n, msg,
+                                   tables[0], NULL, options, arena);
+  if (ds == kUpb_DecodeStatus_Ok) {
+    emit_header(id, "ok");
+    emit_dump(msg, tables[0]);
     emit_end();
   } else if (ds == kUpb_DecodeStatus_Malformed) {
     emit_header(id, "error");
@@ -801,6 +1037,22 @@ int main(void) {
       json_string(line, "\"md\"", md, sizeof(md));
       json_int(line, "\"depth\"", &depth);
       run_decode_known(id, hex, md, depth);
+    } else if (strcmp(op, "decode_submsg") == 0) {
+      char mds[MAX_TABLES][MAX_INPUT_BYTES] = {{0}};
+      int64_t links[MAX_TABLES][64] = {{0}};
+      int link_lens[MAX_TABLES] = {0};
+      int64_t depth = 0;
+      int n_mds = json_string_array(line, "\"mds\"", mds, MAX_TABLES);
+      int n_links = json_int_array2(line, "\"links\"", links, link_lens,
+                                    MAX_TABLES);
+      json_int(line, "\"depth\"", &depth);
+      if (n_mds < 1 || n_links != n_mds) {
+        emit_header(id, "error");
+        emit_field_str("code", "bad_request");
+        emit_end();
+        continue;
+      }
+      run_decode_submsg(id, hex, depth, mds, n_mds, links, link_lens);
     } else {
       emit_header(id, "error");
       emit_field_str("code", "unknown_op");
